@@ -37,6 +37,14 @@ pub struct Event {
     pub branch: String,
     /// The agent or role that authored this event.
     pub author: String,
+    /// Agent-loop iteration that produced this event (1-based). One step = one
+    /// model round-trip plus its tool executions. Transient/stream-only: set in
+    /// the live agent loop for in-process consumers, never persisted to DB
+    /// backends (reconstructed as 0, the "unknown" sentinel). Mirrors
+    /// deepseek-harness's per-event `{turn, step}` so UIs count steps from the
+    /// authoritative loop counter rather than inferring boundaries.
+    #[serde(default)]
+    pub step: u32,
     /// The LLM response containing content and metadata.
     /// Access content via `event.llm_response.content`.
     #[serde(flatten)]
@@ -142,6 +150,7 @@ impl Event {
             invocation_id: invocation_id.into(),
             branch: String::new(),
             author: String::new(),
+            step: 0,
             llm_response: LlmResponse::default(),
             actions: EventActions::default(),
             long_running_tool_ids: Vec::new(),
@@ -159,6 +168,7 @@ impl Event {
             invocation_id: invocation_id.into(),
             branch: String::new(),
             author: String::new(),
+            step: 0,
             llm_response: LlmResponse::default(),
             actions: EventActions::default(),
             long_running_tool_ids: Vec::new(),

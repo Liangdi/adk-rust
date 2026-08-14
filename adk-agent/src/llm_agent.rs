@@ -119,9 +119,11 @@ fn build_partial_llm_event(
     request_json: &str,
     chunk: &LlmResponse,
     long_running_tool_ids: Vec<String>,
+    step: u32,
 ) -> Event {
     let mut event = Event::with_id(event_id, invocation_id);
     event.author = agent_name.to_string();
+    event.step = step;
     event.llm_request = Some(request_json.to_string());
     event
         .provider_metadata
@@ -154,9 +156,11 @@ fn build_final_llm_event(
     content: Option<&Content>,
     last_chunk: Option<&LlmResponse>,
     long_running_tool_ids: Vec<String>,
+    step: u32,
 ) -> Event {
     let mut event = Event::with_id(event_id, invocation_id);
     event.author = agent_name.to_string();
+    event.step = step;
     event.llm_request = Some(request_json.to_string());
     event
         .provider_metadata
@@ -2521,6 +2525,7 @@ impl Agent for LlmAgent {
                     if let Some(ref content) = accumulated_content {
                         cached_event.long_running_tool_ids = collect_long_running_ids(content);
                     }
+                    cached_event.step = iteration;
 
                     yield Ok(cached_event);
                 } else {
@@ -2626,6 +2631,7 @@ impl Agent for LlmAgent {
                                 &request_json,
                                 &chunk,
                                 long_running_tool_ids,
+                                iteration,
                             ));
                         }
 
@@ -2675,6 +2681,7 @@ impl Agent for LlmAgent {
                             accumulated_content.as_ref(),
                             last_chunk.as_ref(),
                             long_running_tool_ids,
+                            iteration,
                         ));
                     }
 
@@ -2803,6 +2810,7 @@ impl Agent for LlmAgent {
                             // Yield a final state update event
                             let mut state_event = Event::new(&invocation_id);
                             state_event.author = agent_name.clone();
+                            state_event.step = iteration;
                             state_event.actions.state_delta.insert(
                                 output_key.clone(),
                                 serde_json::Value::String(text_parts),
@@ -2918,6 +2926,7 @@ impl Agent for LlmAgent {
                                 conversation_history.push(error_content.clone());
                                 let mut error_event = Event::new(&invocation_id);
                                 error_event.author = agent_name.clone();
+                                error_event.step = iteration;
                                 error_event.llm_response.content = Some(error_content);
                                 yield Ok(error_event);
                                 continue;
@@ -2925,6 +2934,7 @@ impl Agent for LlmAgent {
 
                             let mut transfer_event = Event::new(&invocation_id);
                             transfer_event.author = agent_name.clone();
+                            transfer_event.step = iteration;
                             transfer_event.actions.transfer_to_agent = Some(target_agent);
                             yield Ok(transfer_event);
                             transfer_handled = true;
@@ -2992,6 +3002,7 @@ impl Agent for LlmAgent {
 
                                 let mut ce = Event::new(&invocation_id);
                                 ce.author = agent_name.clone();
+                                ce.step = iteration;
                                 ce.llm_response.interrupted = true;
                                 ce.llm_response.turn_complete = true;
                                 ce.llm_response.content = Some(Content {
@@ -3135,14 +3146,16 @@ impl Agent for LlmAgent {
                         let results = loop {
                             tokio::select! {
                                 biased;
-                                Some(progress_event) = progress_rx.recv() => {
+                                Some(mut progress_event) = progress_rx.recv() => {
+                                    progress_event.step = iteration;
                                     yield Ok(progress_event);
                                 }
                                 done = &mut dispatch => break done,
                             }
                         };
                         // Flush any progress chunks buffered between the last poll and completion.
-                        while let Ok(progress_event) = progress_rx.try_recv() {
+                        while let Ok(mut progress_event) = progress_rx.try_recv() {
+                            progress_event.step = iteration;
                             yield Ok(progress_event);
                         }
                         results
@@ -3157,6 +3170,7 @@ impl Agent for LlmAgent {
                     for result in results {
                         let mut tool_event = Event::new(&invocation_id);
                         tool_event.author = agent_name.clone();
+                        tool_event.step = iteration;
                         tool_event.actions = result.actions;
                         tool_event.llm_response.content = Some(result.content.clone());
                         yield Ok(tool_event);

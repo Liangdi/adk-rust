@@ -352,6 +352,7 @@ impl SessionService for PostgresSessionService {
                 invocation_id: row.get("invocation_id"),
                 branch: row.get("branch"),
                 author: row.get("author"),
+                step: 0,
                 llm_request: None,
                 llm_response,
                 actions,

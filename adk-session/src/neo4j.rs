@@ -285,6 +285,7 @@ fn row_to_event(row: &neo4rs::Row) -> Option<Event> {
         invocation_id,
         branch,
         author,
+        step: 0,
         llm_response,
         actions,
         long_running_tool_ids,

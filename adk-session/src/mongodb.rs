@@ -756,6 +756,7 @@ fn doc_to_event(doc: &Document) -> Option<Event> {
         invocation_id: doc.get_str("invocation_id").unwrap_or_default().to_string(),
         branch: doc.get_str("branch").unwrap_or_default().to_string(),
         author: doc.get_str("author").unwrap_or_default().to_string(),
+        step: 0,
         llm_request: None,
         llm_response,
         actions,

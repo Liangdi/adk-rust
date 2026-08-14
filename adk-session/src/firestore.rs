@@ -199,6 +199,7 @@ fn doc_to_event(doc: &EventDoc) -> std::result::Result<Event, adk_core::AdkError
         invocation_id: doc.invocation_id.clone(),
         branch: doc.branch.clone(),
         author: doc.author.clone(),
+        step: 0,
         llm_request: None,
         llm_response,
         actions,
