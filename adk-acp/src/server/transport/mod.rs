@@ -1,12 +1,17 @@
 //! Transport layer for ACP protocol messages.
 //!
 //! Defines the [`Transport`] trait and provides [`StdioTransport`] for the
-//! official ACP JSON-RPC stream over stdin/stdout.
+//! official ACP JSON-RPC stream over stdin/stdout. The HTTP transport
+//! (`HttpTransport`) is available behind the `http` feature.
 //!
-//! ACP v1's stable local transport is stdio. Remote HTTP/WebSocket transport
-//! remains under specification work and is not advertised here.
+//! Both transports share [`build_agent_component`], which wires the session
+//! handler into the official ACP SDK's typed callbacks.
 
+pub mod component;
 pub mod stdio;
+
+#[cfg(feature = "http")]
+pub mod http;
 
 use std::sync::Arc;
 
@@ -15,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::AcpServerError;
 use super::handler::AcpSessionHandler;
+
+pub use component::build_agent_component;
 
 /// A transport layer for ACP protocol messages.
 ///
@@ -35,3 +42,6 @@ pub trait Transport: Send + Sync {
 }
 
 pub use stdio::StdioTransport;
+
+#[cfg(feature = "http")]
+pub use http::HttpTransport;

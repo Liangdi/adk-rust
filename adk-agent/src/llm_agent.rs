@@ -1557,6 +1557,17 @@ impl ToolContext for AgentToolContext {
         }
     }
 
+    async fn elicit(
+        &self,
+        request: &adk_core::ElicitationRequest,
+    ) -> adk_core::Result<Option<adk_core::ElicitationResponse>> {
+        if let Some(handler) = self.parent_ctx.run_config().elicitation_handler.clone() {
+            handler.elicit(request).await
+        } else {
+            Ok(None)
+        }
+    }
+
     fn user_scopes(&self) -> Vec<String> {
         self.parent_ctx.user_scopes()
     }

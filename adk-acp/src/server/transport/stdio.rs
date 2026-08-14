@@ -2,25 +2,17 @@
 
 use std::sync::Arc;
 
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
-    CancelNotification, CloseSessionRequest, CloseSessionResponse, DeleteSessionRequest,
-    DeleteSessionResponse, ForkSessionRequest, ForkSessionResponse, Implementation,
-    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, ResumeSessionRequest, ResumeSessionResponse, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
-};
-use agent_client_protocol::{Agent, Client, ConnectTo, ConnectionTo, Error, Responder, Stdio};
+use agent_client_protocol::{Agent, ConnectTo, Error, Stdio};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::super::capabilities::{AgentCapabilities, CapabilitiesBuilder};
 use super::super::config::AcpServerConfig;
 use super::super::error::AcpServerError;
 use super::super::handler::AcpSessionHandler;
 use super::Transport;
+use super::component::build_agent_component;
 
 /// ACP's standard local-process transport. The official SDK owns JSON-RPC
 /// framing, request IDs, typed message decoding, cancellation, and stdio I/O.
@@ -50,13 +42,13 @@ impl Transport for StdioTransport {
         shutdown: CancellationToken,
     ) -> Result<(), AcpServerError> {
         info!(agent = %self.agent_name, "official ACP v1 stdio transport started");
-        let connection = serve_connection(
+        let component = build_agent_component(
             handler,
             self.capabilities.clone(),
             self.agent_name.clone(),
             self.agent_title.clone(),
-            Stdio::new(),
         );
+        let connection = component.connect_to(Stdio::new());
 
         tokio::select! {
             result = connection => result.map_err(|error| AcpServerError::Transport(error.to_string())),
@@ -65,6 +57,7 @@ impl Transport for StdioTransport {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn serve_connection<C>(
     handler: Arc<AcpSessionHandler>,
     initialize_capabilities: AgentCapabilities,
@@ -75,354 +68,13 @@ pub(crate) async fn serve_connection<C>(
 where
     C: ConnectTo<Agent> + 'static,
 {
-    let new_handler = handler.clone();
-    let prompt_handler = handler.clone();
-    let cancel_handler = handler.clone();
-    let close_handler = handler.clone();
-    let resume_handler = handler.clone();
-    let load_handler = handler.clone();
-    let fork_handler = handler.clone();
-    let set_mode_handler = handler.clone();
-    let set_config_handler = handler.clone();
-    let list_handler = handler.clone();
-    let delete_handler = handler;
-
-    Agent
-        .builder()
-        .name(initialize_name.clone())
-        .on_receive_request(
-            move |request: InitializeRequest,
-                  responder: Responder<InitializeResponse>,
-                  _connection: ConnectionTo<Client>| {
-                let capabilities = initialize_capabilities.clone();
-                let name = initialize_name.clone();
-                let title = initialize_title.clone();
-                async move {
-                    let version = match request.protocol_version {
-                        ProtocolVersion::V1 => ProtocolVersion::V1,
-                        _ => ProtocolVersion::V1,
-                    };
-                    let mut implementation = Implementation::new(name, env!("CARGO_PKG_VERSION"));
-                    if !title.is_empty() {
-                        implementation = implementation.title(title);
-                    }
-                    responder.respond(
-                        InitializeResponse::new(version)
-                            .agent_capabilities(capabilities)
-                            .agent_info(implementation),
-                    )
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: NewSessionRequest,
-                  responder: Responder<NewSessionResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = new_handler.clone();
-                async move {
-                    let cancellation = responder.cancellation();
-                    let spawned_connection = connection.clone();
-                    connection.spawn(async move {
-                        let response = match handler.create_session(request, cancellation).await {
-                            Ok(session_id) => {
-                                emit_activation_updates(&handler, &session_id, &spawned_connection)
-                                    .await;
-                                let (modes, config_options) =
-                                    handler.session_controls_snapshot(&session_id).await;
-                                Ok(NewSessionResponse::new(session_id)
-                                    .modes(modes)
-                                    .config_options(config_options))
-                            }
-                            Err(error) => Err(to_protocol_error(error)),
-                        };
-                        responder.respond_with_result(response)
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: PromptRequest,
-                  responder: Responder<PromptResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = prompt_handler.clone();
-                async move {
-                    let cancellation = responder.cancellation();
-                    let spawned_connection = connection.clone();
-                    connection.spawn(async move {
-                        let session_id = request.session_id.clone();
-                        let cancellation_handler = handler.clone();
-                        let work = handler.handle_prompt(request, spawned_connection);
-                        tokio::pin!(work);
-                        let result = tokio::select! {
-                            result = &mut work => result,
-                            _ = cancellation.cancelled() => {
-                                cancellation_handler.cancel_session(&session_id).await;
-                                work.await
-                            }
-                        };
-                        responder.respond_with_result(
-                            result.map(PromptResponse::new).map_err(to_protocol_error),
-                        )
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_notification(
-            async move |notification: CancelNotification, _connection: ConnectionTo<Client>| {
-                cancel_handler.cancel_session(&notification.session_id).await;
-                Ok(())
-            },
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .on_receive_request(
-            async move |request: CloseSessionRequest,
-                        responder: Responder<CloseSessionResponse>,
-                        _connection: ConnectionTo<Client>| {
-                match close_handler.close_session(&request.session_id).await {
-                    Ok(()) => responder.respond(CloseSessionResponse::new()),
-                    Err(error) => responder.respond_with_error(to_protocol_error(error)),
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: ResumeSessionRequest,
-                  responder: Responder<ResumeSessionResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = resume_handler.clone();
-                async move {
-                    let cancellation = responder.cancellation();
-                    let spawned_connection = connection.clone();
-                    connection.spawn(async move {
-                        let session_id = request.session_id.clone();
-                        let result = handler
-                            .resume_session(
-                                &request.session_id,
-                                request.cwd,
-                                request.additional_directories,
-                                request.mcp_servers,
-                                cancellation,
-                            )
-                            .await;
-                        let response = match result {
-                            Ok(()) => {
-                                emit_activation_updates(&handler, &session_id, &spawned_connection)
-                                    .await;
-                                let (modes, config_options) =
-                                    handler.session_controls_snapshot(&session_id).await;
-                                Ok(ResumeSessionResponse::new()
-                                    .modes(modes)
-                                    .config_options(config_options))
-                            }
-                            Err(error) => Err(to_protocol_error(error)),
-                        };
-                        responder.respond_with_result(response)
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: LoadSessionRequest,
-                  responder: Responder<LoadSessionResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = load_handler.clone();
-                async move {
-                    let cancellation = responder.cancellation();
-                    let replay_connection = connection.clone();
-                    let activation_connection = connection.clone();
-                    connection.spawn(async move {
-                        let session_id = request.session_id.clone();
-                        let result = handler
-                            .load_session(
-                                &request.session_id,
-                                request.cwd,
-                                request.additional_directories,
-                                request.mcp_servers,
-                                cancellation,
-                                replay_connection,
-                            )
-                            .await;
-                        let response = match result {
-                            Ok(()) => {
-                                emit_activation_updates(
-                                    &handler,
-                                    &session_id,
-                                    &activation_connection,
-                                )
-                                .await;
-                                let (modes, config_options) =
-                                    handler.session_controls_snapshot(&session_id).await;
-                                Ok(LoadSessionResponse::new()
-                                    .modes(modes)
-                                    .config_options(config_options))
-                            }
-                            Err(error) => Err(to_protocol_error(error)),
-                        };
-                        responder.respond_with_result(response)
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: ForkSessionRequest,
-                  responder: Responder<ForkSessionResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = fork_handler.clone();
-                async move {
-                    let cancellation = responder.cancellation();
-                    let spawned_connection = connection.clone();
-                    connection.spawn(async move {
-                        let result = handler
-                            .fork_session(
-                                &request.session_id,
-                                request.cwd,
-                                request.additional_directories,
-                                request.mcp_servers,
-                                cancellation,
-                            )
-                            .await;
-                        let response = match result {
-                            Ok(new_session_id) => {
-                                emit_activation_updates(
-                                    &handler,
-                                    &new_session_id,
-                                    &spawned_connection,
-                                )
-                                .await;
-                                let (modes, config_options) =
-                                    handler.session_controls_snapshot(&new_session_id).await;
-                                Ok(ForkSessionResponse::new(new_session_id)
-                                    .modes(modes)
-                                    .config_options(config_options))
-                            }
-                            Err(error) => Err(to_protocol_error(error)),
-                        };
-                        responder.respond_with_result(response)
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: SetSessionModeRequest,
-                  responder: Responder<SetSessionModeResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = set_mode_handler.clone();
-                async move {
-                    let spawned_connection = connection.clone();
-                    connection.spawn(async move {
-                        responder.respond_with_result(
-                            handler
-                                .set_mode(&request.session_id, &request.mode_id, spawned_connection)
-                                .await
-                                .map(|()| SetSessionModeResponse::new())
-                                .map_err(to_protocol_error),
-                        )
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            move |request: SetSessionConfigOptionRequest,
-                  responder: Responder<SetSessionConfigOptionResponse>,
-                  connection: ConnectionTo<Client>| {
-                let handler = set_config_handler.clone();
-                async move {
-                    let spawned_connection = connection.clone();
-                    connection.spawn(async move {
-                        let session_id = request.session_id.clone();
-                        let result = handler
-                            .set_config_option(
-                                &request.session_id,
-                                &request.config_id,
-                                request.value,
-                                spawned_connection,
-                            )
-                            .await;
-                        let response = match result {
-                            Ok(()) => {
-                                let (_, config_options) =
-                                    handler.session_controls_snapshot(&session_id).await;
-                                Ok(SetSessionConfigOptionResponse::new(
-                                    config_options.unwrap_or_default(),
-                                ))
-                            }
-                            Err(error) => Err(to_protocol_error(error)),
-                        };
-                        responder.respond_with_result(response)
-                    })?;
-                    Ok(())
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: ListSessionsRequest,
-                        responder: Responder<ListSessionsResponse>,
-                        _connection: ConnectionTo<Client>| {
-                match list_handler.list_sessions(request).await {
-                    Ok(response) => responder.respond(response),
-                    Err(error) => responder.respond_with_error(to_protocol_error(error)),
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            async move |request: DeleteSessionRequest,
-                        responder: Responder<DeleteSessionResponse>,
-                        _connection: ConnectionTo<Client>| {
-                match delete_handler.delete_session(&request.session_id).await {
-                    Ok(()) => responder.respond(DeleteSessionResponse::new()),
-                    Err(error) => responder.respond_with_error(to_protocol_error(error)),
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .connect_to(component)
-        .await
-}
-
-/// Best-effort emission of the session-activation `session/update`
-/// notifications (available commands and session info) for a freshly-active
-/// session.
-///
-/// A transport hiccup while sending these notifications must not fail the
-/// surrounding session request, so any error is logged and swallowed rather
-/// than propagated.
-async fn emit_activation_updates(
-    handler: &Arc<AcpSessionHandler>,
-    session_id: &agent_client_protocol::schema::v1::SessionId,
-    connection: &ConnectionTo<Client>,
-) {
-    if let Err(error) = handler.emit_session_activation_updates(session_id, connection).await {
-        warn!(%error, session_id = %session_id, "failed to emit session activation updates");
-    }
-}
-
-fn to_protocol_error(error: AcpServerError) -> Error {
-    match error {
-        AcpServerError::MalformedMessage(message)
-        | AcpServerError::SessionNotFound(message)
-        | AcpServerError::UnsupportedVersion { requested: message, .. } => {
-            Error::invalid_params().data(message)
-        }
-        AcpServerError::MaxSessionsReached(max) => {
-            Error::invalid_params().data(format!("maximum active sessions reached: {max}"))
-        }
-        other => Error::internal_error().data(other.to_string()),
-    }
+    let agent_component = build_agent_component(
+        handler,
+        initialize_capabilities,
+        initialize_name,
+        initialize_title,
+    );
+    agent_component.connect_to(component).await
 }
 
 #[cfg(test)]
@@ -434,8 +86,10 @@ mod tests {
         Agent as AdkAgent, Content, Event, EventStream, InvocationContext, Result as AdkResult,
         ToolConfirmationDecision, ToolConfirmationRequest,
     };
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        AudioContent, AvailableCommand, CancelNotification, ContentBlock, DeleteSessionRequest,
+        AudioContent, AvailableCommand, CancelNotification, CloseSessionRequest,
+        ContentBlock, DeleteSessionRequest,
         EmbeddedResource as AcpEmbeddedResource, EmbeddedResourceResource, ForkSessionRequest,
         ImageContent, InitializeRequest, ListSessionsRequest, LoadSessionRequest,
         NewSessionRequest, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
@@ -445,7 +99,7 @@ mod tests {
         SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest,
         StopReason, TextContent, TextResourceContents as AcpTextResourceContents,
     };
-    use agent_client_protocol::{Channel, Client, Responder};
+    use agent_client_protocol::{Channel, Client, ConnectionTo, Responder};
     use async_trait::async_trait;
     use base64::{Engine as _, engine::general_purpose};
     use tokio::sync::Notify;
@@ -879,44 +533,52 @@ mod tests {
         }
 
         async fn run(&self, ctx: Arc<dyn InvocationContext>) -> AdkResult<EventStream> {
-            let decision = ctx.run_config().tool_confirmation_decisions.get("call-1").copied();
+            // Mirrors how the real LlmAgent runner handles confirmation: it calls
+            // the live `tool_confirmation_handler` (if any) inline within the
+            // turn, applies the decision, and continues — no pause/resume. The
+            // AcpSessionHandler wires `LivePermissionBridge` as that handler, so
+            // this drive_permission_turn harness exercises the full nested
+            // `session/request_permission` round trip in a single runner run.
+            let handler = ctx.run_config().tool_confirmation_handler.clone();
             let applied_decision = self.applied_decision.clone();
             let executed = self.executed.clone();
             let s = async_stream::stream! {
-                match decision {
-                    Some(decision) => {
-                        *applied_decision.lock().expect("decision lock") = Some(decision);
-                        let mut event = Event::new("confirm-resume");
-                        event.author = "confirming-agent".to_string();
-                        let text = match decision {
-                            ToolConfirmationDecision::Approve => {
-                                *executed.lock().expect("executed lock") = true;
-                                "tool executed: /tmp/report.csv"
-                            }
-                            ToolConfirmationDecision::Deny => {
-                                *executed.lock().expect("executed lock") = false;
-                                "tool call skipped"
-                            }
-                        };
-                        event.set_content(Content::new("model").with_text(text));
-                        yield Ok(event);
-                    }
-                    None => {
-                        let mut event = Event::new("confirm-pause");
-                        event.author = "confirming-agent".to_string();
-                        event.llm_response.interrupted = true;
-                        event.llm_response.turn_complete = true;
-                        event.set_content(
-                            Content::new("model").with_text("Tool confirmation required"),
-                        );
-                        event.actions.tool_confirmation = Some(ToolConfirmationRequest {
+                let decision = match handler {
+                    Some(handler) => match handler
+                        .decide(&ToolConfirmationRequest {
                             tool_name: "delete_file".to_string(),
                             function_call_id: Some("call-1".to_string()),
                             args: serde_json::json!({"path": "/tmp/report.csv"}),
-                        });
-                        yield Ok(event);
+                        })
+                        .await
+                    {
+                        Ok(d) => Some(d),
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
+                let mut event = Event::new("confirm-resume");
+                event.author = "confirming-agent".to_string();
+                let text = match decision {
+                    Some(ToolConfirmationDecision::Approve) => {
+                        *applied_decision.lock().expect("decision lock") =
+                            Some(ToolConfirmationDecision::Approve);
+                        *executed.lock().expect("executed lock") = true;
+                        "tool executed: /tmp/report.csv"
                     }
-                }
+                    Some(ToolConfirmationDecision::Deny) => {
+                        *applied_decision.lock().expect("decision lock") =
+                            Some(ToolConfirmationDecision::Deny);
+                        *executed.lock().expect("executed lock") = false;
+                        "tool call skipped"
+                    }
+                    None => {
+                        *executed.lock().expect("executed lock") = false;
+                        "Tool confirmation required"
+                    }
+                };
+                event.set_content(Content::new("model").with_text(text));
+                yield Ok(event);
             };
             Ok(Box::pin(s))
         }

@@ -15,6 +15,7 @@ categories = ["development-tools", "asynchronous"]
 [features]
 default = []
 server = ["dep:adk-runner", "dep:adk-session", "dep:adk-tool", "dep:rmcp", "dep:tokio-util", "dep:uuid", "dep:async-stream"]
+http = ["dep:agent-client-protocol-http", "dep:axum", "server"]
 
 [dependencies]
 adk-core = { workspace = true }
@@ -22,14 +23,14 @@ adk-core = { workspace = true }
 # dispatch (`ForkSessionRequest` / `ForkSessionResponse`, the `session.fork`
 # capability). The method is stable-adjacent in the SDK but gated behind this
 # feature; we enable it to implement Requirement 10 (session fork).
-agent-client-protocol = { version = "1.2.0", features = ["unstable_session_fork"] }
+agent-client-protocol = { version = "2.0.0", features = ["unstable_session_fork", "unstable_elicitation"] }
 async-trait = { workspace = true }
 base64 = "0.22"
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync", "process", "io-util", "io-std", "macros", "rt", "time"] }
+tokio = { workspace = true, features = ["sync", "process", "io-util", "io-std", "macros", "rt", "time", "net"] }
 tracing = { workspace = true }
 
 # Server-specific dependencies (behind `server` feature)
@@ -40,6 +41,10 @@ rmcp = { version = "3.1", features = ["client", "transport-child-process"], opti
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 uuid = { workspace = true, optional = true }
 async-stream = { workspace = true, optional = true }
+
+# HTTP transport dependencies (behind `http` feature, which implies `server`)
+agent-client-protocol-http = { version = "2.0.0", features = ["server"], optional = true }
+axum = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # Internal dev-deps are path-only (no version) so cargo strips them from the

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use adk_core::Content;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, EnvVariable, InitializeRequest, InitializeResponse, McpServer,
+    ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, McpServer,
     NewSessionRequest, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SessionNotification, SessionUpdate,
 };
@@ -457,20 +457,11 @@ pub(crate) fn build_agent(config: &AcpAgentConfig) -> Result<AcpAgent> {
     let parsed = AcpAgent::from_str(&config.command).map_err(|error| {
         AcpError::InvalidConfig(format!("invalid command '{}': {error}", config.command))
     })?;
-    match parsed.into_server() {
-        McpServer::Stdio(mut stdio) => {
-            stdio.env.extend(
-                config
-                    .env
-                    .iter()
-                    .map(|(name, value)| EnvVariable::new(name.clone(), value.clone())),
-            );
-            Ok(AcpAgent::new(McpServer::Stdio(stdio)))
-        }
-        _ => Err(AcpError::InvalidConfig(
-            "AcpAgentConfig currently supports local stdio agents".into(),
-        )),
-    }
+    // SDK v2: `AcpAgent` parses the command line directly and no longer exposes
+    // a `into_server()`/`McpServer` split. Inject env vars via the config
+    // builder: round-trip the parsed agent to its config, merge env, rebuild.
+    let launch = parsed.into_config().envs(config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    Ok(AcpAgent::new(launch))
 }
 
 #[cfg(test)]

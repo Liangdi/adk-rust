@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use adk_core::{
     Agent, Content, RunConfig, SessionId as AdkSessionId, ToolConfirmationDecision,
-    ToolConfirmationRequest, Toolset, UserId,
+    ToolConfirmationHandler, ToolConfirmationRequest, Toolset, UserId,
 };
 use adk_runner::Runner;
 use adk_session::{CreateRequest, DeleteRequest, GetRequest, ListRequest, SessionService};
@@ -80,6 +80,156 @@ pub struct AcpSessionHandler {
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     shutdown_token: CancellationToken,
     session_controls: Option<Arc<dyn SessionControls>>,
+}
+
+/// Live tool-confirmation handler that bridges ADK tool confirmations to ACP
+/// `session/request_permission` **within the same runner turn** (no pause/resume).
+///
+/// When the runner reaches a tool call that requires confirmation, it calls
+/// [`ToolConfirmationHandler::decide`] inline. This sends an ACP
+/// `session/request_permission` to the client, awaits the outcome, and returns
+/// the mapped decision. The runner then executes (or skips) the tool in the
+/// same turn and appends the tool result, so providers never see an assistant
+/// `tool_calls` message without a following tool result.
+#[derive(Clone)]
+struct LivePermissionBridge {
+    connection: ConnectionTo<Client>,
+    session_id: SessionId,
+}
+
+#[async_trait::async_trait]
+impl ToolConfirmationHandler for LivePermissionBridge {
+    async fn decide(
+        &self,
+        request: &ToolConfirmationRequest,
+    ) -> adk_core::Result<ToolConfirmationDecision> {
+        PermissionBridge::request(&self.connection, &self.session_id, request)
+            .await
+            .map_err(|e| adk_core::AdkError::tool(format!("permission request failed: {e}")))
+    }
+}
+
+impl std::fmt::Debug for LivePermissionBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LivePermissionBridge").finish_non_exhaustive()
+    }
+}
+
+/// Live elicitation handler: bridges agent-initiated questions to ACP
+/// `elicitation/create` within the same runner turn. Maps [`ElicitationRequest`]
+/// (adk-core's provider-agnostic shape) to the ACP `ElicitationFormMode` schema
+/// and the `ElicitationAction` response back to [`ElicitationResponse`].
+#[derive(Clone)]
+struct LiveElicitationBridge {
+    connection: ConnectionTo<Client>,
+    session_id: SessionId,
+}
+
+#[async_trait::async_trait]
+impl adk_core::ElicitationHandler for LiveElicitationBridge {
+    async fn elicit(
+        &self,
+        request: &adk_core::ElicitationRequest,
+    ) -> adk_core::Result<Option<adk_core::ElicitationResponse>> {
+        use agent_client_protocol::schema::v1::{
+            CreateElicitationRequest, ElicitationFormMode, ElicitationPropertySchema,
+            ElicitationRequestScope, ElicitationSchema, ElicitationScope, EnumOption,
+            MultiSelectPropertySchema, StringPropertySchema,
+        };
+
+        // Build an ACP object schema with one property per adk-core field.
+        let mut schema = ElicitationSchema::new();
+        for field in &request.fields {
+            let prop = match &field.kind {
+                adk_core::ElicitationFieldKind::Text => {
+                    ElicitationPropertySchema::String(
+                        StringPropertySchema::new().title(field.title.clone()),
+                    )
+                }
+                adk_core::ElicitationFieldKind::SingleSelect { options } => {
+                    let one_of: Vec<EnumOption> = options
+                        .iter()
+                        .map(|o| EnumOption::new(o.value.clone(), o.title.clone()))
+                        .collect();
+                    ElicitationPropertySchema::String(
+                        StringPropertySchema::new().title(field.title.clone()).one_of(one_of),
+                    )
+                }
+                adk_core::ElicitationFieldKind::MultiSelect { options } => {
+                    let titled: Vec<EnumOption> = options
+                        .iter()
+                        .map(|o| EnumOption::new(o.value.clone(), o.title.clone()))
+                        .collect();
+                    ElicitationPropertySchema::Array(
+                        MultiSelectPropertySchema::titled(titled).title(field.title.clone()),
+                    )
+                }
+            };
+            schema = schema.property(field.name.clone(), prop, true);
+        }
+        let scope = ElicitationScope::Request(ElicitationRequestScope::new(
+            // request_id is opaque here; use the session id as a stable
+            // correlation handle (the client correlates by session already).
+            self.session_id.to_string(),
+        ));
+        let acp_request = CreateElicitationRequest::new(
+            ElicitationFormMode::new(scope, schema),
+            request.message.clone(),
+        );
+
+        let response = self
+            .connection
+            .send_request(acp_request)
+            .block_task()
+            .await
+            .map_err(|e| adk_core::AdkError::tool(format!("elicitation request failed: {e}")))?;
+
+        Ok(map_elicitation_action(response.action))
+    }
+}
+
+impl std::fmt::Debug for LiveElicitationBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveElicitationBridge").finish_non_exhaustive()
+    }
+}
+
+/// Map an ACP [`ElicitationAction`] to adk-core's [`ElicitationResponse`].
+fn map_elicitation_action(
+    action: agent_client_protocol::schema::v1::ElicitationAction,
+) -> Option<adk_core::ElicitationResponse> {
+    use agent_client_protocol::schema::v1::ElicitationAction;
+    match action {
+        ElicitationAction::Accept(accept) => {
+            let mut values = std::collections::BTreeMap::new();
+            if let Some(content) = accept.content {
+                for (k, v) in content {
+                    let mapped = match v {
+                        agent_client_protocol::schema::v1::ElicitationContentValue::String(s) => {
+                            adk_core::ElicitationValue::One(s)
+                        }
+                        agent_client_protocol::schema::v1::ElicitationContentValue::StringArray(a) => {
+                            adk_core::ElicitationValue::Many(a)
+                        }
+                        agent_client_protocol::schema::v1::ElicitationContentValue::Integer(i) => {
+                            adk_core::ElicitationValue::One(i.to_string())
+                        }
+                        agent_client_protocol::schema::v1::ElicitationContentValue::Number(n) => {
+                            adk_core::ElicitationValue::One(n.to_string())
+                        }
+                        agent_client_protocol::schema::v1::ElicitationContentValue::Boolean(b) => {
+                            adk_core::ElicitationValue::One(b.to_string())
+                        }
+                        _ => continue,
+                    };
+                    values.insert(k, mapped);
+                }
+            }
+            Some(adk_core::ElicitationResponse { declined: false, values })
+        }
+        // Decline / Cancel / unknown → treat as declined (no content).
+        _ => Some(adk_core::ElicitationResponse { declined: true, values: Default::default() }),
+    }
 }
 
 impl AcpSessionHandler {
@@ -570,118 +720,102 @@ impl AcpSessionHandler {
         let session_id = AdkSessionId::new(request.session_id.to_string())
             .map_err(|e| AcpServerError::Execution(e.to_string()))?;
 
-        // Accumulated tool-confirmation decisions, keyed by function-call ID (the
-        // key `RunConfig::tool_confirmation_decisions` uses, so a decision
-        // authorizes only the call it was granted for). The map grows one decision
-        // per resume as the runner pauses at each still-undecided confirmation.
-        let mut decisions: HashMap<String, ToolConfirmationDecision> = HashMap::new();
-        // The first run carries the client's prompt content; every resume run
-        // carries an empty user turn so the runner replays persisted history and
-        // continues from the paused tool call rather than re-appending the
-        // prompt (the documented resume shape).
-        let mut is_resume = false;
+        // Live tool-confirmation handler: when the agent's runner reaches a tool
+        // call that requires confirmation (per the agent's tool_confirmation_policy),
+        // it calls `decide()` inline within the same turn. We bridge that to an ACP
+        // `session/request_permission` request to the client and await the outcome.
+        //
+        // This replaces the earlier pause/resume loop. Resuming replayed the
+        // persisted history — including an assistant turn carrying `tool_calls`
+        // whose tool result had not yet been produced — which providers like
+        // DeepSeek reject ("tool_calls must be followed by tool messages"). The
+        // live handler keeps the whole turn in one runner invocation, so the tool
+        // result is produced and appended before any second LLM call.
+        let confirmation_handler: Arc<dyn ToolConfirmationHandler> = Arc::new(
+            LivePermissionBridge {
+                connection: connection.clone(),
+                session_id: request.session_id.clone(),
+            },
+        );
+        let elicitation_handler: Arc<dyn adk_core::ElicitationHandler> = Arc::new(
+            LiveElicitationBridge {
+                connection: connection.clone(),
+                session_id: request.session_id.clone(),
+            },
+        );
 
-        // The runner pauses at the first still-undecided confirmation and
-        // resumes one decision at a time, so the number of iterations is bounded
-        // by the number of distinct calls requiring confirmation. The guard is a
-        // defensive backstop against a misbehaving agent that re-interrupts for a
-        // call that already has a decision.
-        const MAX_CONFIRMATION_ROUNDS: usize = 64;
+        let run_config = RunConfig::builder()
+            .runtime_toolsets(runtime_toolsets.clone())
+            .tool_confirmation_handler(confirmation_handler)
+            .elicitation_handler(elicitation_handler)
+            .build();
+        let runner = Runner::builder()
+            .app_name(&self.app_name)
+            .agent(self.agent.clone())
+            .session_service(self.session_service.clone())
+            .cancellation_token(cancellation_token.clone())
+            .run_config(run_config)
+            .build()
+            .map_err(|e| AcpServerError::Execution(format!("failed to create runner: {e}")))?;
 
-        for _round in 0..MAX_CONFIRMATION_ROUNDS {
-            let run_config = RunConfig::builder()
-                .runtime_toolsets(runtime_toolsets.clone())
-                .tool_confirmation_decisions(decisions.clone())
-                .build();
-            let runner = Runner::builder()
-                .app_name(&self.app_name)
-                .agent(self.agent.clone())
-                .session_service(self.session_service.clone())
-                .cancellation_token(cancellation_token.clone())
-                .run_config(run_config)
-                .build()
-                .map_err(|e| AcpServerError::Execution(format!("failed to create runner: {e}")))?;
+        let mut stream = runner
+            .run(user_id.clone(), session_id.clone(), content.clone())
+            .await
+            .map_err(|e| AcpServerError::Execution(format!("runner.run failed: {e}")))?;
 
-            let run_content =
-                if is_resume { Content::new("user").with_text("") } else { content.clone() };
-            let mut stream = runner
-                .run(user_id.clone(), session_id.clone(), run_content)
-                .await
-                .map_err(|e| AcpServerError::Execution(format!("runner.run failed: {e}")))?;
+        // True once any *partial* (streaming delta) agent text event has been
+        // seen this turn. Streaming providers send deltas as partials and then a
+        // final event carrying the full reply; once a partial arrived we suppress
+        // the final event's text chunk so the client does not receive the whole
+        // answer twice.
+        let mut saw_partial_agent_text = false;
 
-            // Confirmations surfaced during this run, awaiting a client decision.
-            let mut pending: Vec<ToolConfirmationRequest> = Vec::new();
-
-            loop {
-                let result = tokio::select! {
-                    _ = cancellation_token.cancelled() => return Ok(StopReason::Cancelled),
-                    result = stream.next() => result,
-                };
-                let Some(result) = result else {
-                    break;
-                };
-                match result {
-                    Ok(event) => {
-                        // A confirmation interrupt carries a placeholder text
-                        // message; capture the request and do not stream it as an
-                        // agent message. The client instead receives a native
-                        // `session/request_permission` request below.
-                        if let Some(confirmation) = &event.actions.tool_confirmation {
-                            pending.push(confirmation.clone());
-                            continue;
-                        }
-                        for update in ResponseStreamer::map_event(&event) {
-                            connection
-                                .send_notification(SessionNotification::new(
-                                    request.session_id.clone(),
-                                    update,
-                                ))
-                                .map_err(|e| AcpServerError::Transport(e.to_string()))?;
-                        }
+        loop {
+            let result = tokio::select! {
+                _ = cancellation_token.cancelled() => return Ok(StopReason::Cancelled),
+                result = stream.next() => result,
+            };
+            let Some(result) = result else {
+                break;
+            };
+            match result {
+                Ok(event) => {
+                    // With the live confirmation handler wired above, the runner
+                    // resolves tool confirmations inline (it calls the handler,
+                    // not the interrupt path), so a `tool_confirmation` action
+                    // should not surface here. If one ever does, skip it: the
+                    // client learns about the request through the native
+                    // `session/request_permission` the handler already sent.
+                    if event.actions.tool_confirmation.is_some() {
+                        continue;
                     }
-                    Err(error) => {
-                        if cancellation_token.is_cancelled() {
-                            return Ok(StopReason::Cancelled);
-                        }
-                        warn!(%error, session_id = %request.session_id, "ACP Runner event failed");
-                        return Err(AcpServerError::Execution(error.to_string()));
+                    if event.llm_response.partial {
+                        saw_partial_agent_text = true;
+                    }
+                    // If the turn streamed partials, drop the final event's agent
+                    // text (it is the accumulated reply = a duplicate).
+                    let updates =
+                        ResponseStreamer::map_event_filtered(&event, !saw_partial_agent_text);
+                    for update in updates {
+                        connection
+                            .send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                update,
+                            ))
+                            .map_err(|e| AcpServerError::Transport(e.to_string()))?;
                     }
                 }
-            }
-
-            // No outstanding confirmations means the turn completed.
-            if pending.is_empty() {
-                return Ok(StopReason::EndTurn);
-            }
-
-            // Drive the permission bridge for each pending confirmation: send a
-            // `session/request_permission` to the client, await the outcome, and
-            // record the decision (cancellation → deny) against the exact call for
-            // the next resume run.
-            for confirmation in &pending {
-                if cancellation_token.is_cancelled() {
-                    return Ok(StopReason::Cancelled);
+                Err(error) => {
+                    if cancellation_token.is_cancelled() {
+                        return Ok(StopReason::Cancelled);
+                    }
+                    warn!(%error, session_id = %request.session_id, "ACP Runner event failed");
+                    return Err(AcpServerError::Execution(error.to_string()));
                 }
-                let decision =
-                    PermissionBridge::request(&connection, &request.session_id, confirmation)
-                        .await?;
-                // A confirmation without a call ID cannot be bound to one call, so
-                // there is nothing safe to authorize.
-                let Some(call_id) = confirmation.function_call_id.clone() else {
-                    return Err(AcpServerError::Execution(
-                        "tool confirmation request carried no function call ID, so a \
-                         decision cannot be bound to the call"
-                            .into(),
-                    ));
-                };
-                decisions.insert(call_id, decision);
             }
-            is_resume = true;
         }
 
-        Err(AcpServerError::Execution(
-            "tool confirmation did not converge within the permitted number of rounds".into(),
-        ))
+        Ok(StopReason::EndTurn)
     }
 
     /// Cancel the prompt currently running in a session.

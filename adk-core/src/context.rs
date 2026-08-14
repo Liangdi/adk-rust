@@ -1021,6 +1021,10 @@ pub struct RunConfig {
     /// Optional live decision source for confirmations that have no static
     /// entry in [`tool_confirmation_decisions`](Self::tool_confirmation_decisions).
     pub tool_confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
+    /// Optional source for agent-initiated elicitation (asking the user a
+    /// question). Protocol adapters wire this to ACP `elicitation/create`; tools
+    /// reach it via [`ToolContext::elicit`].
+    pub elicitation_handler: Option<Arc<dyn crate::ElicitationHandler>>,
     /// Toolsets made available only for this invocation.
     pub runtime_toolsets: Vec<RuntimeToolset>,
     /// Optional cached content name for automatic prompt caching.
@@ -1076,6 +1080,7 @@ impl Default for RunConfig {
             tool_confirmation_decisions: HashMap::new(),
             tool_confirmation_fingerprints: HashMap::new(),
             tool_confirmation_handler: None,
+            elicitation_handler: None,
             runtime_toolsets: Vec::new(),
             cached_content: None,
             transfer_targets: Vec::new(),
@@ -1165,6 +1170,12 @@ impl RunConfigBuilder {
     /// Sets an asynchronous tool confirmation handler for the current run.
     pub fn tool_confirmation_handler(mut self, handler: Arc<dyn ToolConfirmationHandler>) -> Self {
         self.config.tool_confirmation_handler = Some(handler);
+        self
+    }
+
+    /// Sets an elicitation handler tools can use to ask the user a question.
+    pub fn elicitation_handler(mut self, handler: Arc<dyn crate::ElicitationHandler>) -> Self {
+        self.config.elicitation_handler = Some(handler);
         self
     }
 

@@ -203,7 +203,6 @@ impl AcpSession {
                                             continue;
                                         }
 
-                                        let connection = session.connection();
                                         let session_id = session.session_id().clone();
                                         let mut response = String::new();
                                         let mut cancellation_requested = false;
@@ -246,12 +245,15 @@ impl AcpSession {
                                                     match command {
                                                         Some(SessionCommand::Cancel) => {
                                                             cancellation_requested = true;
-                                                            connection.send_notification(
+                                                            // Acquire the connection inline (not held across the
+                                                            // select) so it doesn't alias `session` while
+                                                            // `read_update` borrows it mutably.
+                                                            session.connection().send_notification(
                                                                 CancelNotification::new(session_id.clone()),
                                                             )?;
                                                         }
                                                         Some(SessionCommand::Close) => {
-                                                            connection.send_notification(
+                                                            session.connection().send_notification(
                                                                 CancelNotification::new(session_id.clone()),
                                                             )?;
                                                             let _ = result_tx.send(SessionResult::Closed).await;

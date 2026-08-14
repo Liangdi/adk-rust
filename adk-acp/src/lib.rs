@@ -79,7 +79,7 @@ pub use host::{AcpFileSystem, AcpTerminal};
 pub use permissions::{PermissionDecision, PermissionPolicy, PermissionRequest};
 pub use session::{AcpCancellationHandle, AcpSession, PromptResult};
 pub use status::{AgentStatus, StatusTracker};
-pub use streaming::{OutputChunk, OutputStream, stream_prompt};
+pub use streaming::{ElicitationSink, OutputChunk, OutputStream, stream_prompt, stream_prompt_elicit};
 pub use tool::AcpAgentTool;
 pub use toolset::AcpToolset;
 pub use usage::{AcpUsage, AcpUsageStats, UsageTracker};

@@ -55,7 +55,10 @@ pub use error::{AcpServerError, ErrorResponse};
 pub use handler::AcpSessionHandler;
 pub use modes::{SessionControls, config_state_key};
 pub use streamer::ResponseStreamer;
-pub use transport::{StdioTransport, Transport};
+pub use transport::{Transport, build_agent_component};
+#[cfg(feature = "http")]
+pub use transport::HttpTransport;
+pub use transport::StdioTransport;
 
 /// Handle returned by [`AcpServer::run()`] for lifecycle control.
 ///
@@ -127,6 +130,14 @@ impl AcpServer {
 
         let transport: Box<dyn Transport> = match &config.transport {
             TransportConfig::Stdio => Box::new(StdioTransport::new(&config)),
+            #[cfg(feature = "http")]
+            TransportConfig::Http { addr } => Box::new(HttpTransport::new(*addr, &config)),
+            #[cfg(not(feature = "http"))]
+            TransportConfig::Http { .. } => {
+                return Err(AcpServerError::Internal(
+                    "HTTP transport requires the `http` feature on adk-acp".to_string(),
+                ));
+            }
         };
 
         let shutdown_timeout = config.shutdown_timeout;

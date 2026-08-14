@@ -31,6 +31,13 @@ pub enum TransportConfig {
     /// Stdio transport (newline-delimited JSON on stdin/stdout).
     #[default]
     Stdio,
+    /// HTTP/WebSocket transport bound to a TCP address.
+    ///
+    /// Requires the `http` feature on `adk-acp`.
+    Http {
+        /// TCP address to bind the HTTP listener.
+        addr: std::net::SocketAddr,
+    },
 }
 
 /// Configuration for the ACP Server.

@@ -122,6 +122,90 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value>;
 }
 
+/// One field in an elicitation form: a name plus a JSON-Schema-ish spec.
+///
+/// Kept as `serde_json::Value` so adk-core does not depend on the ACP schema
+/// crate's unstable elicitation types. Protocol adapters translate this to the
+/// wire `ElicitationPropertySchema`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElicitationField {
+    /// Field name the user's answer is keyed under.
+    pub name: String,
+    /// Human-readable label / title.
+    pub title: String,
+    /// Optional one-line description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The kind of input to collect.
+    pub kind: ElicitationFieldKind,
+}
+
+/// The input shape of one elicitation field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationFieldKind {
+    /// Free-form text.
+    Text,
+    /// Pick exactly one of `options`.
+    SingleSelect {
+        /// The choices offered.
+        options: Vec<ElicitationOption>,
+    },
+    /// Pick any of `options`.
+    MultiSelect {
+        /// The choices offered.
+        options: Vec<ElicitationOption>,
+    },
+}
+
+/// A selectable option.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElicitationOption {
+    /// Stable value returned in the answer.
+    pub value: String,
+    /// Human-readable label.
+    pub title: String,
+}
+
+/// A request to elicit structured input from the user.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElicitationRequest {
+    /// Human-readable message describing what input is needed.
+    pub message: String,
+    /// Form fields. For the common single-question case this is one field.
+    pub fields: Vec<ElicitationField>,
+}
+
+/// A user answer to an elicitation: a map of field name → value (string or
+/// string-array for multi-select).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ElicitationResponse {
+    /// True if the user declined/cancelled instead of answering.
+    pub declined: bool,
+    /// Per-field answers. String for Text/SingleSelect, joined for MultiSelect.
+    pub values: std::collections::BTreeMap<String, ElicitationValue>,
+}
+
+/// One field's answered value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ElicitationValue {
+    /// Single value (text or single-select).
+    One(String),
+    /// Multiple values (multi-select).
+    Many(Vec<String>),
+}
+
+/// Asynchronous source for agent-initiated elicitation (asking the user a
+/// question). Protocol adapters implement this to bridge to ACP
+/// `elicitation/create` (or a UI dialog). When absent, [`ToolContext::elicit`]
+/// returns `None` and tools degrade to an error.
+#[async_trait]
+pub trait ElicitationHandler: std::fmt::Debug + Send + Sync {
+    /// Ask the user; return their answer or `None` if unavailable/declined.
+    async fn elicit(&self, request: &ElicitationRequest) -> Result<Option<ElicitationResponse>>;
+}
+
 /// Context available to tools during execution.
 ///
 /// Extends [`CallbackContext`] with tool-specific operations like accessing
@@ -136,6 +220,16 @@ pub trait ToolContext: CallbackContext {
     fn set_actions(&self, actions: EventActions);
     /// Searches memory for entries matching the query.
     async fn search_memory(&self, query: &str) -> Result<Vec<MemoryEntry>>;
+
+    /// Elicit structured input from the user (agent-initiated question).
+    ///
+    /// Tools call this to ask the human a question (single/multi-select options
+    /// or free text) and block until an answer arrives. Returns `Ok(None)` when
+    /// no elicitation handler is wired (non-interactive runs); tools should then
+    /// degrade to an error rather than hang. The default returns `None`.
+    async fn elicit(&self, _request: &ElicitationRequest) -> Result<Option<ElicitationResponse>> {
+        Ok(None)
+    }
 
     /// Emit streaming progress output during long-running tool execution.
     ///

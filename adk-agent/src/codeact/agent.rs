@@ -2595,6 +2595,16 @@ impl ToolContext for CodeToolContext {
             None => Ok(vec![]),
         }
     }
+    async fn elicit(
+        &self,
+        request: &adk_core::ElicitationRequest,
+    ) -> adk_core::Result<Option<adk_core::ElicitationResponse>> {
+        if let Some(handler) = self.inner.run_config().elicitation_handler.clone() {
+            handler.elicit(request).await
+        } else {
+            Ok(None)
+        }
+    }
     fn user_scopes(&self) -> Vec<String> {
         self.inner.user_scopes()
     }

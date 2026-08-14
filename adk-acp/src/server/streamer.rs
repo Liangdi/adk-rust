@@ -23,9 +23,33 @@ impl ResponseStreamer {
     /// carries usage metadata. Events without usage metadata produce no usage
     /// update, and reported token counts are never fabricated.
     pub fn map_event(event: &Event) -> Vec<SessionUpdate> {
+        Self::map_event_filtered(event, true)
+    }
+
+    /// Convert one ADK event into ACP updates.
+    ///
+    /// `emit_final_agent_text` controls whether a *non-partial* (final) agent
+    /// text event's content is emitted as an `AgentMessageChunk`. Streaming
+    /// providers send each delta as a *partial* event (its text is just the new
+    /// fragment) and then one *final* event whose text is the fully accumulated
+    /// reply. Emitting both duplicates the whole response, so a live streaming
+    /// turn sets this flag to `false` once any partial has been seen, while
+    /// non-streaming runs (a single final event, no partials) keep it `true` so
+    /// the agent's text is not lost.
+    pub fn map_event_filtered(event: &Event, emit_final_agent_text: bool) -> Vec<SessionUpdate> {
         let mut updates = Vec::new();
         if let Some(content) = event.content() {
-            Self::map_content(content, &mut updates);
+            // A final (non-partial) agent text event is the full reply; in a
+            // streaming turn it would re-send text the partials already
+            // delivered. Suppress its message chunk unless the caller asked for
+            // it (the non-streaming / replay path).
+            let partial = event.llm_response.partial;
+            let suppress_agent_text = !partial
+                && !content.role.eq_ignore_ascii_case("user")
+                && !emit_final_agent_text;
+            if !suppress_agent_text {
+                Self::map_content(content, &mut updates);
+            }
         }
         if let Some(usage) = &event.llm_response.usage_metadata {
             updates.push(SessionUpdate::UsageUpdate(map_usage(usage)));

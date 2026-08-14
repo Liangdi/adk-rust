@@ -104,6 +104,21 @@ pub enum OutputChunk {
 /// ```
 pub type OutputStream = mpsc::Receiver<OutputChunk>;
 
+/// Sink the client uses to surface an agent-initiated elicitation
+/// (`elicitation/create`) to the host application and await the user's answer.
+#[async_trait::async_trait]
+pub trait ElicitationSink: std::fmt::Debug + Send + Sync {
+    /// Resolve an elicitation request. Return `Err` to deny the request
+    /// (the agent's tool receives an error).
+    async fn resolve(
+        &self,
+        request: agent_client_protocol::schema::v1::CreateElicitationRequest,
+    ) -> std::result::Result<
+        agent_client_protocol::schema::v1::CreateElicitationResponse,
+        String,
+    >;
+}
+
 /// Send a prompt and stream the response chunks.
 ///
 /// Returns a receiver that yields [`OutputChunk`]s as they arrive.
@@ -113,6 +128,29 @@ pub async fn stream_prompt(
     prompt: &str,
     policy: Arc<PermissionPolicy>,
     status: StatusTracker,
+) -> Result<OutputStream> {
+    stream_prompt_inner(config, prompt, policy, status, None).await
+}
+
+/// Like [`stream_prompt`] but also routes agent-initiated elicitation
+/// (`elicitation/create`) requests through `elicitation`. Requires the
+/// `unstable_elicitation` feature on the `agent-client-protocol` dependency.
+pub async fn stream_prompt_elicit(
+    config: &AcpAgentConfig,
+    prompt: &str,
+    policy: Arc<PermissionPolicy>,
+    status: StatusTracker,
+    elicitation: Arc<dyn ElicitationSink>,
+) -> Result<OutputStream> {
+    stream_prompt_inner(config, prompt, policy, status, Some(elicitation)).await
+}
+
+async fn stream_prompt_inner(
+    config: &AcpAgentConfig,
+    prompt: &str,
+    policy: Arc<PermissionPolicy>,
+    status: StatusTracker,
+    elicitation: Option<Arc<dyn ElicitationSink>>,
 ) -> Result<OutputStream> {
     info!(command = %config.command, "starting streaming ACP prompt");
 
@@ -193,6 +231,38 @@ pub async fn stream_prompt(
                             status.set(AgentStatus::Running);
                             responder.respond(RequestPermissionResponse::new(outcome))
                         })?;
+                            Ok(())
+                        }
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let elicitation = elicitation.clone();
+                    move |request: agent_client_protocol::schema::v1::CreateElicitationRequest,
+                          responder: agent_client_protocol::Responder<
+                        agent_client_protocol::schema::v1::CreateElicitationResponse,
+                    >,
+                          cx: ConnectionTo<Agent>| {
+                        let elicitation = elicitation.clone();
+                        async move {
+                            // No sink wired → reject (method not found) so the
+                            // agent's tool degrades rather than hanging.
+                            let Some(sink) = elicitation else {
+                                return Ok(());
+                            };
+                            cx.spawn(async move {
+                                match sink.resolve(request).await {
+                                    Ok(response) => responder.respond(response),
+                                    Err(message) => {
+                                        responder.respond_with_result(Err(
+                                            agent_client_protocol::Error::method_not_found()
+                                                .data(message),
+                                        ))
+                                    }
+                                }
+                            })?;
                             Ok(())
                         }
                     }

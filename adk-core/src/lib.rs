@@ -145,8 +145,9 @@ pub use schema_adapter::{GenericSchemaAdapter, SchemaAdapter};
 pub use schema_cache::SchemaCache;
 pub use shared_state::{SharedState, SharedStateError};
 pub use tool::{
-    RetryBudget, Tool, ToolContext, ToolExecutionStrategy, ToolPredicate, ToolRegistry, Toolset,
-    ValidationMode,
+    ElicitationField, ElicitationFieldKind, ElicitationHandler, ElicitationOption,
+    ElicitationRequest, ElicitationResponse, ElicitationValue, RetryBudget, Tool, ToolContext,
+    ToolExecutionStrategy, ToolPredicate, ToolRegistry, Toolset, ValidationMode,
 };
 pub use tool_concurrency::{ConcurrencyPermit, ToolConcurrencyManager};
 pub use types::{
