@@ -6,6 +6,8 @@ use agent_client_protocol::schema::v1::{
     SessionCloseCapabilities, SessionDeleteCapabilities, SessionForkCapabilities,
     SessionListCapabilities, SessionResumeCapabilities,
 };
+#[cfg(feature = "mcp-http")]
+use agent_client_protocol::schema::v1::McpCapabilities;
 
 use super::config::AcpServerConfig;
 
@@ -33,7 +35,7 @@ impl CapabilitiesBuilder {
     /// untouched (see
     /// [`AcpSessionHandler::fork_session`](crate::server::handler::AcpSessionHandler::fork_session)).
     pub fn build(_config: &AcpServerConfig) -> AgentCapabilities {
-        AgentCapabilities::new()
+        let capabilities = AgentCapabilities::new()
             .load_session(true)
             .prompt_capabilities(
                 PromptCapabilities::new().embedded_context(true).image(true).audio(true),
@@ -46,7 +48,13 @@ impl CapabilitiesBuilder {
                     .resume(SessionResumeCapabilities::new())
                     .fork(SessionForkCapabilities::new())
                     .close(SessionCloseCapabilities::new()),
-            )
+            );
+        // `mcp_capabilities.http` ⇔ the `mcp-http` feature compiles the
+        // streamable-HTTP branch of `start_mcp_servers` in (Capability_Accuracy).
+        #[cfg(feature = "mcp-http")]
+        let capabilities =
+            capabilities.mcp_capabilities(McpCapabilities::new().http(true));
+        capabilities
     }
 }
 

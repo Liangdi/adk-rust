@@ -16,6 +16,9 @@ categories = ["development-tools", "asynchronous"]
 default = []
 server = ["dep:adk-runner", "dep:adk-session", "dep:adk-tool", "dep:rmcp", "dep:tokio-util", "dep:uuid", "dep:async-stream"]
 http = ["dep:agent-client-protocol-http", "dep:axum", "server"]
+# Accept `McpServer::Http` entries in `session/new` (streamable HTTP MCP clients
+# via adk-tool's McpHttpClientBuilder) and advertise `mcp_capabilities.http`.
+mcp-http = ["server", "adk-tool?/http-transport"]
 
 [dependencies]
 adk-core = { workspace = true }

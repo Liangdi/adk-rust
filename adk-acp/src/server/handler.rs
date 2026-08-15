@@ -12,6 +12,8 @@ use adk_core::{
 use adk_runner::Runner;
 use adk_session::{CreateRequest, DeleteRequest, GetRequest, ListRequest, SessionService};
 use adk_tool::McpToolset;
+#[cfg(feature = "mcp-http")]
+use adk_tool::mcp::McpHttpClientBuilder;
 use agent_client_protocol::RequestCancellation;
 use agent_client_protocol::schema::v1::{
     ContentBlock, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
@@ -1168,58 +1170,131 @@ async fn start_mcp_servers(
         cancellations: Vec::with_capacity(servers.len()),
     };
     for server in servers {
-        let McpServer::Stdio(config) = server else {
-            return Err(AcpServerError::MalformedMessage(
-                "this ACP agent supports the required MCP stdio transport; HTTP and SSE were not advertised"
-                    .into(),
-            ));
-        };
-        if !config.command.is_absolute() {
-            return Err(AcpServerError::MalformedMessage(format!(
-                "MCP server '{}' command must be an absolute path",
-                config.name
-            )));
-        }
-
-        let mut command = tokio::process::Command::new(&config.command);
-        command.args(&config.args).current_dir(cwd);
-        for variable in &config.env {
-            command.env(&variable.name, &variable.value);
-        }
-        let transport = TokioChildProcess::new(command).map_err(|error| {
-            AcpServerError::Execution(format!(
-                "failed to start MCP server '{}': {error}",
-                config.name
-            ))
-        })?;
-        let startup = tokio::time::timeout(MCP_STARTUP_TIMEOUT, ().serve(transport));
-        let client = tokio::select! {
-            _ = cancellation.cancelled() => {
-                return Err(AcpServerError::Execution(
-                    "ACP session creation was cancelled while starting MCP servers".into(),
-                ));
+        match server {
+            McpServer::Stdio(config) => {
+                start_stdio_mcp_server(config, cwd, cancellation, &mut resources).await?;
             }
-            result = startup => result,
+            #[cfg(feature = "mcp-http")]
+            McpServer::Http(config) => {
+                start_http_mcp_server(config, cancellation, &mut resources).await?;
+            }
+            unsupported => {
+                return Err(AcpServerError::MalformedMessage(format!(
+                    "this ACP agent does not support the {} MCP transport; only stdio{} was advertised",
+                    transport_kind(unsupported),
+                    if cfg!(feature = "mcp-http") { " and HTTP" } else { "" },
+                )));
+            }
         }
-        .map_err(|_| {
-            AcpServerError::Execution(format!(
-                "MCP server '{}' did not initialize within {} seconds",
-                config.name,
-                MCP_STARTUP_TIMEOUT.as_secs()
-            ))
-        })?
-        .map_err(|error| {
-            AcpServerError::Execution(format!(
-                "failed to initialize MCP server '{}': {error}",
-                config.name
-            ))
-        })?;
-        let toolset = McpToolset::new(client).with_name(format!("acp:{}", config.name));
-        let cancellation = toolset.cancellation_token().await;
-        resources.cancellations.push(Some(cancellation));
-        resources.toolsets.push(Arc::new(toolset));
     }
     Ok(resources)
+}
+
+/// MCP transport name for error messages (`Sse` remains unsupported).
+fn transport_kind(server: &McpServer) -> &'static str {
+    match server {
+        McpServer::Stdio(_) => "stdio",
+        McpServer::Http(_) => "HTTP",
+        McpServer::Sse(_) => "SSE",
+        _ => "unknown",
+    }
+}
+
+/// Start one stdio MCP server (spawn a child process in `cwd`) and attach its
+/// toolset to the session resources.
+async fn start_stdio_mcp_server(
+    config: &agent_client_protocol::schema::v1::McpServerStdio,
+    cwd: &Path,
+    cancellation: &RequestCancellation,
+    resources: &mut McpSessionResources,
+) -> Result<(), AcpServerError> {
+    if !config.command.is_absolute() {
+        return Err(AcpServerError::MalformedMessage(format!(
+            "MCP server '{}' command must be an absolute path",
+            config.name
+        )));
+    }
+
+    let mut command = tokio::process::Command::new(&config.command);
+    command.args(&config.args).current_dir(cwd);
+    for variable in &config.env {
+        command.env(&variable.name, &variable.value);
+    }
+    let transport = TokioChildProcess::new(command).map_err(|error| {
+        AcpServerError::Execution(format!(
+            "failed to start MCP server '{}': {error}",
+            config.name
+        ))
+    })?;
+    let startup = tokio::time::timeout(MCP_STARTUP_TIMEOUT, ().serve(transport));
+    let client = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(AcpServerError::Execution(
+                "ACP session creation was cancelled while starting MCP servers".into(),
+            ));
+        }
+        result = startup => result,
+    }
+    .map_err(|_| {
+        AcpServerError::Execution(format!(
+            "MCP server '{}' did not initialize within {} seconds",
+            config.name,
+            MCP_STARTUP_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| {
+        AcpServerError::Execution(format!(
+            "failed to initialize MCP server '{}': {error}",
+            config.name
+        ))
+    })?;
+    let toolset = McpToolset::new(client).with_name(format!("acp:{}", config.name));
+    let cancellation = toolset.cancellation_token().await;
+    resources.cancellations.push(Some(cancellation));
+    resources.toolsets.push(Arc::new(toolset));
+    Ok(())
+}
+
+/// Start one streamable-HTTP MCP server (feature `mcp-http`) and attach its
+/// toolset to the session resources. Unlike stdio there is no child process;
+/// the remote endpoint is contacted with the client-supplied headers.
+#[cfg(feature = "mcp-http")]
+async fn start_http_mcp_server(
+    config: &agent_client_protocol::schema::v1::McpServerHttp,
+    cancellation: &RequestCancellation,
+    resources: &mut McpSessionResources,
+) -> Result<(), AcpServerError> {
+    let mut builder = McpHttpClientBuilder::new(&config.url).timeout(MCP_STARTUP_TIMEOUT);
+    for header in &config.headers {
+        builder = builder.header(&header.name, &header.value);
+    }
+    let startup = tokio::time::timeout(MCP_STARTUP_TIMEOUT, builder.connect());
+    let connect = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(AcpServerError::Execution(
+                "ACP session creation was cancelled while starting MCP servers".into(),
+            ));
+        }
+        result = startup => result,
+    }
+    .map_err(|_| {
+        AcpServerError::Execution(format!(
+            "MCP server '{}' did not initialize within {} seconds",
+            config.name,
+            MCP_STARTUP_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(|error| {
+        AcpServerError::Execution(format!(
+            "failed to initialize MCP server '{}': {error}",
+            config.name
+        ))
+    })?;
+    let toolset = connect.with_name(format!("acp:{}", config.name));
+    let cancellation = toolset.cancellation_token().await;
+    resources.cancellations.push(Some(cancellation));
+    resources.toolsets.push(Arc::new(toolset));
+    Ok(())
 }
 
 fn validate_mcp_servers(servers: &[McpServer]) -> Result<(), AcpServerError> {
@@ -1231,35 +1306,49 @@ fn validate_mcp_servers(servers: &[McpServer]) -> Result<(), AcpServerError> {
     }
     let mut names = std::collections::HashSet::new();
     for server in servers {
-        let McpServer::Stdio(config) = server else {
-            return Err(AcpServerError::MalformedMessage(
-                "this ACP agent supports the required MCP stdio transport; HTTP and SSE were not advertised"
-                    .into(),
-            ));
+        let (name, env): (&str, &[_]) = match server {
+            McpServer::Stdio(config) => (config.name.as_str(), &config.env[..]),
+            #[cfg(feature = "mcp-http")]
+            McpServer::Http(config) => {
+                if config.url.trim().is_empty() {
+                    return Err(AcpServerError::MalformedMessage(format!(
+                        "MCP server '{}' has an empty url",
+                        config.name
+                    )));
+                }
+                (config.name.as_str(), &[])
+            }
+            unsupported => {
+                return Err(AcpServerError::MalformedMessage(format!(
+                    "this ACP agent does not support the {} MCP transport",
+                    transport_kind(unsupported)
+                )));
+            }
         };
-        if config.name.trim().is_empty() {
+        let config_name = name;
+        if name.trim().is_empty() {
             return Err(AcpServerError::MalformedMessage(
                 "MCP server names cannot be empty".into(),
             ));
         }
-        if !names.insert(config.name.as_str()) {
+        if !names.insert(config_name) {
             return Err(AcpServerError::MalformedMessage(format!(
                 "duplicate MCP server name: {}",
-                config.name
+                config_name
             )));
         }
         let mut environment_names = std::collections::HashSet::new();
-        for variable in &config.env {
+        for variable in env {
             if variable.name.trim().is_empty() {
                 return Err(AcpServerError::MalformedMessage(format!(
                     "MCP server '{}' has an empty environment variable name",
-                    config.name
+                    config_name
                 )));
             }
             if !environment_names.insert(variable.name.as_str()) {
                 return Err(AcpServerError::MalformedMessage(format!(
                     "MCP server '{}' repeats environment variable '{}'",
-                    config.name, variable.name
+                    config_name, variable.name
                 )));
             }
         }
