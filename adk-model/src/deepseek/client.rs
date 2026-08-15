@@ -10,7 +10,7 @@ use super::convert::{
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use adk_core::{
     AdkError, ErrorCategory, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm, LlmRequest,
-    LlmResponse, LlmResponseStream, Part, SchemaAdapter,
+    LlmResponse, LlmResponseStream, Part, RetryHint, SchemaAdapter,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -31,7 +31,8 @@ use serde_json::Value;
 ///         .with_reasoning_effort(ReasoningEffort::Max)
 /// )?;
 ///
-/// // V4 Flash (fast, no thinking by default)
+/// // V4 Flash (fast; the API's default thinking is enabled — pass
+/// // `with_thinking_mode(ThinkingMode::Disabled)` to turn it off)
 /// let flash = DeepSeekClient::v4_flash("api-key")?;
 /// ```
 ///
@@ -217,7 +218,6 @@ impl Llm for DeepSeekClient {
         let chat_request = self.build_request(&request, stream);
         let client = self.client.clone();
         let retry_config = self.retry_config.clone();
-        let thinking_enabled = self.config.is_thinking_enabled();
 
         let response_stream = try_stream! {
             let response = execute_with_retry(&retry_config, is_retryable_model_error, || {
@@ -294,24 +294,30 @@ impl Llm for DeepSeekClient {
                                 Ok(chunk_response) => {
                                     if let Some(choice) = chunk_response.choices.first() {
                                         if let Some(delta) = &choice.delta {
-                                            // Accumulate reasoning content
+                                            // Accumulate reasoning content and stream it
+                                            // out as partial Thinking events. Emission
+                                            // mirrors what the server sends, not the
+                                            // local thinking flag: a request without an
+                                            // explicit `thinking` field (server default
+                                            // = enabled on V4) still carries
+                                            // reasoning_content deltas, and suppressing
+                                            // them here would hide the model's
+                                            // reasoning until the final event.
                                             if let Some(reasoning) = &delta.reasoning_content
                                                 && !reasoning.is_empty() {
                                                     reasoning_buffer.push_str(reasoning);
-                                                    if thinking_enabled {
-                                                        yield LlmResponse {
-                                                            content: Some(adk_core::Content {
-                                                                role: "model".to_string(),
-                                                                parts: vec![Part::Thinking {
-                                                                    thinking: reasoning.clone(),
-                                                                    signature: None,
-                                                                }],
-                                                            }),
-                                                            partial: true,
-                                                            turn_complete: false,
-                                                            ..Default::default()
-                                                        };
-                                                    }
+                                                    yield LlmResponse {
+                                                        content: Some(adk_core::Content {
+                                                            role: "model".to_string(),
+                                                            parts: vec![Part::Thinking {
+                                                                thinking: reasoning.clone(),
+                                                                signature: None,
+                                                            }],
+                                                        }),
+                                                        partial: true,
+                                                        turn_complete: false,
+                                                        ..Default::default()
+                                                    };
                                                 }
 
                                             // Handle tool calls
@@ -330,8 +336,18 @@ impl Llm for DeepSeekClient {
                                                         entry.0.clone_from(id);
                                                     }
                                                     if let Some(func) = &tc.function {
-                                                        if let Some(name) = &func.name {
-                                                            entry.1.clone_from(name);
+                                                        // Some gateways repeat `function.name` as ""
+                                                        // on every continuation delta (the OpenAI
+                                                        // stream contract omits it instead); a blank
+                                                        // must not clobber the name the first delta
+                                                        // carried. The finish-side guard still fails
+                                                        // loudly when NO delta ever named the call.
+                                                        if let Some(name) = func
+                                                            .name
+                                                            .as_deref()
+                                                            .filter(|n| !n.trim().is_empty())
+                                                        {
+                                                            entry.1 = name.to_string();
                                                         }
                                                         if let Some(args_chunk) = &func.arguments {
                                                             entry.2.push_str(args_chunk);
@@ -357,6 +373,42 @@ impl Llm for DeepSeekClient {
                                                 let mut sorted_calls: Vec<_> =
                                                     tool_call_accumulators.drain().collect();
                                                 sorted_calls.sort_by_key(|(idx, _)| *idx);
+                                                // Guard: an upstream (gateway) occasionally drops
+                                                // `function.name` from the streamed tool-call
+                                                // deltas, accumulating an empty name while the
+                                                // arguments arrive intact. Emitting that call
+                                                // poisons the turn: the dispatcher can't resolve
+                                                // "" (a "Tool not found" result the model can't
+                                                // act on), and the *next* request replays a
+                                                // `name: ""` tool call that strict upstreams
+                                                // reject with HTTP 400 "missing field `name`".
+                                                // Failing here keeps the session history clean;
+                                                // the error is marked retryable because the
+                                                // drop is transient.
+                                                if let Some((_, (id, name, _))) = sorted_calls
+                                                    .iter()
+                                                    .find(|(_, (_, name, _))| name.trim().is_empty())
+                                                {
+                                                    // try_stream!: `Err(e)?` yields the error item
+                                                    // and ends the stream (a bare `yield Err(..)`
+                                                    // would type as the Ok payload).
+                                                    Err(AdkError::new(
+                                                        ErrorComponent::Model,
+                                                        ErrorCategory::Unavailable,
+                                                        "model.deepseek.empty_tool_name",
+                                                        format!(
+                                                            "upstream streamed tool call `{id}` \
+                                                             with an empty function.name; retry \
+                                                             the turn"
+                                                        ),
+                                                    )
+                                                    .with_retry(RetryHint {
+                                                        should_retry: true,
+                                                        ..Default::default()
+                                                    })
+                                                    .with_provider("deepseek"))?;
+                                                    return;
+                                                }
                                                 let tool_calls: Vec<_> = sorted_calls
                                                     .into_iter()
                                                     .map(|(_, (id, name, args_str))| {
@@ -366,11 +418,19 @@ impl Llm for DeepSeekClient {
                                                         (id, name, args)
                                                     })
                                                     .collect();
-                                                let tool_reasoning = if thinking_enabled {
-                                                    Some(std::mem::take(&mut reasoning_buffer))
-                                                } else {
-                                                    None
-                                                };
+                                                // Buffered reasoning rides along when
+                                                // present — the same server-default
+                                                // reasoning a text turn keeps, so a
+                                                // thinking→tool-call step does not
+                                                // silently drop its trail.
+                                                let tool_reasoning =
+                                                    if reasoning_buffer.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(std::mem::take(
+                                                            &mut reasoning_buffer,
+                                                        ))
+                                                    };
                                                 yield convert::create_tool_call_response(
                                                     tool_calls,
                                                     finish_reason,
@@ -531,6 +591,29 @@ mod response_format_tests {
     }
 
     #[test]
+    fn thinking_mode_and_effort_reach_the_wire() {
+        // Explicit knobs serialize; an unset config omits both fields so the
+        // server default applies.
+        let explicit = DeepSeekClient::new(
+            DeepSeekConfig::new("test-key", "deepseek-v4-flash")
+                .with_thinking_mode(crate::deepseek::config::ThinkingMode::Enabled)
+                .with_reasoning_effort(crate::deepseek::config::ReasoningEffort::Max),
+        )
+        .expect("client builds");
+        let wire =
+            serde_json::to_value(explicit.build_request(&request_with(None, "hi"), false))
+                .expect("request serializes");
+        assert_eq!(wire["thinking"], json!({ "type": "enabled" }));
+        assert_eq!(wire["reasoning_effort"], json!("max"));
+
+        let default_wire =
+            serde_json::to_value(client().build_request(&request_with(None, "hi"), false))
+                .expect("request serializes");
+        assert!(default_wire.get("thinking").is_none());
+        assert!(default_wire.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn the_documented_json_keyword_requirement_is_satisfied() {
         // DeepSeek requires the word "json" in the system or user prompt whenever
         // JSON Output is enabled, or the API may return empty content.
@@ -563,6 +646,322 @@ mod response_format_tests {
             built.messages.len(),
             1,
             "the prompt already mentions json, so nothing needs to be added"
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_tool_name_tests {
+    //! An upstream gateway occasionally drops `function.name` from streamed
+    //! tool-call deltas (arguments arrive intact). The client must fail the
+    //! turn with a retryable error instead of emitting a `name: ""` call that
+    //! the dispatcher can't resolve and that poisons the next request with a
+    //! 400 "missing field `name`" on strict upstreams.
+
+    use super::*;
+    use adk_core::{Content, LlmRequest};
+    use futures::StreamExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sse(chunks: &[serde_json::Value]) -> String {
+        let mut body = String::new();
+        for c in chunks {
+            body.push_str(&format!("data: {}\n\n", serde_json::to_string(c).unwrap()));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn chunk(delta: serde_json::Value, finish: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "deepseek-v4-pro",
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish,
+            }]
+        })
+    }
+
+    fn client_for(base: String) -> DeepSeekClient {
+        DeepSeekClient::new(
+            DeepSeekConfig::new("test-key", "deepseek-v4-flash").with_base_url(base),
+        )
+        .expect("client should build")
+    }
+
+    fn request() -> LlmRequest {
+        LlmRequest::new("deepseek-v4-flash", vec![Content::new("user").with_text("hi")])
+    }
+
+    #[tokio::test]
+    async fn empty_streamed_tool_name_fails_the_turn() {
+        let server = MockServer::start().await;
+        let body = sse(&[
+            chunk(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_0",
+                        "type": "function",
+                        "function": { "name": "", "arguments": "{\"path\":\"/tmp\"}" }
+                    }]
+                }),
+                None,
+            ),
+            chunk(serde_json::json!({}), Some("tool_calls")),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        let mut stream = client.generate_content(request(), true).await.expect("stream starts");
+        let mut saw_err = false;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                assert_eq!(e.code, "model.deepseek.empty_tool_name", "unexpected error: {e}");
+                assert!(e.is_retryable(), "the drop is transient, retry must be suggested");
+                assert!(e.message.contains("call_0"), "error should name the call id: {e}");
+                saw_err = true;
+            }
+        }
+        assert!(saw_err, "stream must yield an error for an empty tool name");
+    }
+
+    #[tokio::test]
+    async fn named_streamed_tool_call_still_passes() {
+        let server = MockServer::start().await;
+        let body = sse(&[
+            chunk(
+                serde_json::json!({
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_0",
+                        "type": "function",
+                        "function": { "name": "read_file", "arguments": "{\"path\":\"/tmp\"}" }
+                    }]
+                }),
+                None,
+            ),
+            chunk(serde_json::json!({}), Some("tool_calls")),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        let mut stream = client.generate_content(request(), true).await.expect("stream starts");
+        let mut saw_call = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(resp) => {
+                    if let Some(c) = &resp.content
+                        && c.has_function_calls()
+                    {
+                        saw_call = true;
+                    }
+                }
+                Err(e) => panic!("a named tool call must not error: {e}"),
+            }
+        }
+        assert!(saw_call, "the named tool call should reach the stream");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_stream_tests {
+    //! `reasoning_content` deltas must stream out as partial `Thinking` events
+    //! and reach the final response — regardless of the local thinking flag.
+    //! A request without an explicit `thinking` field (the `DeepSeekConfig::new`
+    //! default) still gets server-default thinking on V4 models, so gating
+    //! emission on the client flag hid the model's reasoning until the final
+    //! event and dropped it entirely on thinking→tool-call turns.
+
+    use super::*;
+    use adk_core::{Content, LlmRequest, Part};
+    use futures::StreamExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sse(chunks: &[serde_json::Value]) -> String {
+        let mut body = String::new();
+        for c in chunks {
+            body.push_str(&format!("data: {}\n\n", serde_json::to_string(c).unwrap()));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn chunk(delta: serde_json::Value, finish: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "id": "x",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "deepseek-v4-flash",
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish,
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 40,
+                "total_tokens": 52,
+                "completion_tokens_details": { "reasoning_tokens": 25 }
+            }
+        })
+    }
+
+    fn client_for(base: String) -> DeepSeekClient {
+        // `DeepSeekConfig::new` leaves `thinking: None` (server default) and
+        // the legacy `thinking_enabled` false — the exact configuration whose
+        // reasoning used to be suppressed.
+        DeepSeekClient::new(
+            DeepSeekConfig::new("test-key", "deepseek-v4-flash").with_base_url(base),
+        )
+        .expect("client should build")
+    }
+
+    fn request() -> LlmRequest {
+        LlmRequest::new("deepseek-v4-flash", vec![Content::new("user").with_text("hi")])
+    }
+
+    async fn mount(server: &MockServer, body: String) {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn reasoning_text(resp: &LlmResponse) -> Option<String> {
+        let content = resp.content.as_ref()?;
+        let mut out = String::new();
+        for part in &content.parts {
+            if let Part::Thinking { thinking, .. } = part {
+                out.push_str(thinking);
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_stream_without_local_thinking_flag() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            sse(&[
+                chunk(serde_json::json!({ "reasoning_content": "step one… " }), None),
+                chunk(serde_json::json!({ "reasoning_content": "step two" }), None),
+                chunk(serde_json::json!({ "content": "The answer." }), None),
+                chunk(serde_json::json!({}), Some("stop")),
+            ]),
+        )
+        .await;
+
+        let client = client_for(server.uri());
+        let mut stream = client.generate_content(request(), true).await.expect("stream starts");
+        let mut partials = Vec::new();
+        let mut final_thinking = None;
+        let mut final_text = None;
+        while let Some(item) = stream.next().await {
+            let resp = item.expect("stream item");
+            if resp.partial {
+                let text = resp.content.as_ref().map(|c| {
+                    c.parts
+                        .iter()
+                        .map(|p| match p {
+                            Part::Text { text } => text.clone(),
+                            _ => String::new(),
+                        })
+                        .collect::<String>()
+                });
+                partials.push((reasoning_text(&resp), text));
+            } else {
+                final_thinking = reasoning_text(&resp);
+                final_text = resp.content.as_ref().map(|c| {
+                    c.parts.iter().map(|p| match p {
+                        Part::Text { text } => text.clone(),
+                        _ => String::new(),
+                    }).collect::<String>()
+                });
+            }
+        }
+        // Both reasoning deltas streamed out as partial Thinking events (the
+        // answer-text delta is a third, reasoning-free partial).
+        let reasoning_partials: Vec<_> =
+            partials.iter().filter(|(r, _)| r.is_some()).collect();
+        assert_eq!(
+            reasoning_partials.len(),
+            2,
+            "both reasoning deltas are partial events"
+        );
+        assert_eq!(reasoning_partials[0].0.as_deref(), Some("step one… "));
+        assert_eq!(reasoning_partials[1].0.as_deref(), Some("step two"));
+        // The final response carries the assembled reasoning + text + usage.
+        assert_eq!(final_thinking.as_deref(), Some("step one… step two"));
+        assert_eq!(final_text.as_deref(), Some("The answer."));
+    }
+
+    #[tokio::test]
+    async fn tool_call_turn_keeps_its_reasoning_without_local_flag() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            sse(&[
+                chunk(serde_json::json!({ "reasoning_content": "need a tool" }), None),
+                chunk(
+                    serde_json::json!({
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_0",
+                            "type": "function",
+                            "function": { "name": "read_file", "arguments": "{\"path\":\"/tmp\"}" }
+                        }]
+                    }),
+                    None,
+                ),
+                chunk(serde_json::json!({}), Some("tool_calls")),
+            ]),
+        )
+        .await;
+
+        let client = client_for(server.uri());
+        let mut stream = client.generate_content(request(), true).await.expect("stream starts");
+        let mut tool_thinking = None;
+        while let Some(item) = stream.next().await {
+            let resp = item.expect("stream item");
+            if let Some(c) = &resp.content
+                && c.has_function_calls()
+            {
+                tool_thinking = reasoning_text(&resp);
+            }
+        }
+        assert_eq!(
+            tool_thinking.as_deref(),
+            Some("need a tool"),
+            "a thinking→tool-call turn keeps its reasoning trail"
         );
     }
 }
