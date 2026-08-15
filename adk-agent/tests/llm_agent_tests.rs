@@ -675,3 +675,157 @@ mod sandbox_conflict_tests {
         assert!(result.is_ok());
     }
 }
+
+// ── Streaming accumulation: slim partial events + collapsed history ──────
+
+/// Emits a DeepSeek-shaped stream: reasoning deltas, then a settled chunk
+/// restating the complete buffer (with a tool call), then a plain text turn.
+struct DeepSeekStyleLlm {
+    requests: Arc<Mutex<Vec<LlmRequest>>>,
+}
+
+#[async_trait]
+impl adk_core::Llm for DeepSeekStyleLlm {
+    fn name(&self) -> &str {
+        "deepseek-style"
+    }
+
+    async fn generate_content(
+        &self,
+        request: LlmRequest,
+        _stream: bool,
+    ) -> adk_core::Result<adk_core::LlmResponseStream> {
+        let call_index = {
+            let mut requests = self.requests.lock().unwrap();
+            let index = requests.len();
+            requests.push(request);
+            index
+        };
+        let s = async_stream::stream! {
+            if call_index == 0 {
+                for delta in ["pl", "an"] {
+                    yield Ok(adk_core::LlmResponse {
+                        content: Some(Content {
+                            role: "model".to_string(),
+                            parts: vec![Part::Thinking {
+                                thinking: delta.to_string(),
+                                signature: None,
+                            }],
+                        }),
+                        partial: true,
+                        turn_complete: false,
+                        ..Default::default()
+                    });
+                }
+                yield Ok(adk_core::LlmResponse {
+                    content: Some(Content {
+                        role: "model".to_string(),
+                        parts: vec![
+                            Part::Thinking { thinking: "plan".to_string(), signature: None },
+                            Part::FunctionCall {
+                                name: "get_current_time".to_string(),
+                                args: serde_json::json!({}),
+                                id: None,
+                                thought_signature: None,
+                            },
+                        ],
+                    }),
+                    finish_reason: Some(adk_core::FinishReason::Stop),
+                    partial: false,
+                    turn_complete: false,
+                    ..Default::default()
+                });
+            } else {
+                yield Ok(adk_core::LlmResponse {
+                    content: Some(Content {
+                        role: "model".to_string(),
+                        parts: vec![Part::Text { text: "done".to_string() }],
+                    }),
+                    finish_reason: Some(adk_core::FinishReason::Stop),
+                    partial: false,
+                    turn_complete: true,
+                    ..Default::default()
+                });
+            }
+        };
+        Ok(Box::pin(s))
+    }
+}
+
+#[tokio::test]
+async fn streamed_turns_keep_partials_slim_and_history_collapsed() {
+    let requests: Arc<Mutex<Vec<LlmRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let model = DeepSeekStyleLlm { requests: requests.clone() };
+
+    let get_time_tool = FunctionTool::new(
+        "get_current_time",
+        "Returns the current time",
+        |_ctx: Arc<dyn ToolContext>, _args: Value| async move {
+            Ok(serde_json::json!({ "time": "2025-11-23T14:30:00Z" }))
+        },
+    );
+
+    let agent = LlmAgentBuilder::new("deepseek_style_agent")
+        .description("Streams DeepSeek-shaped chunks")
+        .model(Arc::new(model))
+        .instruction("Use the tool, then answer.")
+        .tool(Arc::new(get_time_tool))
+        .build()
+        .unwrap();
+
+    let ctx = Arc::new(TestContext::new("plan, then call the tool"));
+    let mut stream = agent.run(ctx).await.unwrap();
+
+    use futures::StreamExt;
+    let mut events = Vec::new();
+    while let Some(result) = stream.next().await {
+        events.push(result.unwrap());
+    }
+
+    // No streaming delta carries the serialized request — each copy is the
+    // size of the whole conversation and the runner would retain every one.
+    let mut deltas = 0;
+    for event in &events {
+        if event.llm_response.partial {
+            deltas += 1;
+            assert!(
+                event.llm_request.is_none(),
+                "partial event carries llm_request ({} bytes)",
+                event.llm_request.as_ref().map(|r| r.len()).unwrap_or(0),
+            );
+        }
+    }
+    assert!(deltas >= 2, "expected streaming deltas, saw {deltas}");
+    // The settled chunk of a turn carries the request exactly once.
+    assert!(
+        events
+            .iter()
+            .any(|e| !e.llm_response.partial && e.llm_request.is_some()),
+        "the settled event should carry the request record"
+    );
+
+    // The turn's history entry is the settled snapshot — one thinking part
+    // plus the call — not per-delta parts and not the reasoning twice.
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "the model must be called twice");
+    let model_turns: Vec<&Content> = requests[1]
+        .contents
+        .iter()
+        .filter(|c| c.role == "model")
+        .collect();
+    let last = model_turns.last().expect("model turn in second request");
+    assert_eq!(
+        last.parts,
+        vec![
+            Part::Thinking { thinking: "plan".to_string(), signature: None },
+            Part::FunctionCall {
+                name: "get_current_time".to_string(),
+                args: serde_json::json!({}),
+                id: None,
+                thought_signature: None,
+            },
+        ],
+        "history must hold the collapsed snapshot, got {:?}",
+        last.parts
+    );
+}

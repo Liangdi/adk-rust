@@ -192,6 +192,153 @@ fn build_final_llm_event(
     event
 }
 
+/// The streaming part kinds that accumulate as plain text runs.
+#[derive(Clone, Copy, PartialEq)]
+enum StreamKind {
+    Text,
+    Thinking,
+}
+
+impl StreamKind {
+    fn of(part: &Part) -> Option<Self> {
+        match part {
+            Part::Text { .. } => Some(Self::Text),
+            Part::Thinking { .. } => Some(Self::Thinking),
+            _ => None,
+        }
+    }
+
+    /// The part's text payload when it belongs to this kind.
+    fn text<'a>(&self, part: &'a Part) -> Option<&'a str> {
+        match (self, part) {
+            (Self::Text, Part::Text { text }) => Some(text),
+            (Self::Thinking, Part::Thinking { thinking, .. }) => Some(thinking),
+            _ => None,
+        }
+    }
+}
+
+/// Append a streaming chunk's parts to the accumulated content.
+///
+/// `merge` deltas (partial chunks) into the neighboring accumulated part of
+/// the same kind: providers emit one small part per delta, and extending
+/// blindly left one part per delta — a 4 000-delta reasoning turn produced a
+/// 4 000-part content that every later loop iteration re-cloned and
+/// re-serialized, and that wire converters join with `"\n"` between parts,
+/// replaying the message to the model as newline-corrupted fragments.
+///
+/// A settled chunk's parts (`merge == false`) are pushed standalone so
+/// [`collapse_duplicated_snapshot`] can compare them against the streamed
+/// deltas.
+fn extend_merging(acc: &mut Option<Content>, chunk_content: Content, merge: bool) {
+    let Some(acc) = acc.as_mut() else {
+        *acc = Some(chunk_content);
+        return;
+    };
+    for part in chunk_content.parts {
+        if !merge {
+            acc.parts.push(part);
+            continue;
+        }
+        match (acc.parts.last_mut(), part) {
+            (Some(Part::Text { text: dst }), Part::Text { text: src }) => dst.push_str(&src),
+            (
+                Some(Part::Thinking {
+                    thinking: dst,
+                    signature: dst_sig,
+                }),
+                Part::Thinking {
+                    thinking: src,
+                    signature: src_sig,
+                },
+            ) => {
+                dst.push_str(&src);
+                if dst_sig.is_none() {
+                    *dst_sig = src_sig;
+                }
+            }
+            (_, part) => acc.parts.push(part),
+        }
+    }
+}
+
+/// Reconcile the streamed deltas with the final (non-partial) chunk.
+///
+/// DeepSeek-style providers repeat the complete streamed content in the
+/// final chunk; both copies landed in the accumulation, so every character
+/// of the turn would sit twice in the conversation history. Gemini-style
+/// providers end with the tail of the run, which must concatenate with the
+/// deltas instead of standing beside them. The byte-exact prefix check
+/// tells the two apart:
+///
+/// - accumulated text == snapshot + snapshot → the deltas restated the
+///   snapshot verbatim: keep only the snapshot part.
+/// - accumulated text == deltas + snapshot (deltas ≠ snapshot) → the
+///   snapshot is the run's tail: merge the parts into one.
+fn collapse_duplicated_snapshot(acc: &mut Option<Content>, last_chunk: Option<&LlmResponse>) {
+    let Some(acc) = acc.as_mut() else { return };
+    let Some(last) = last_chunk else { return };
+    if last.partial {
+        return;
+    }
+    let Some(snapshot) = last.content.as_ref() else { return };
+
+    for kind in [StreamKind::Text, StreamKind::Thinking] {
+        let snapshot_text: String =
+            snapshot.parts.iter().filter_map(|part| kind.text(part)).collect();
+        if snapshot_text.is_empty() {
+            continue;
+        }
+        let total: String = acc.parts.iter().filter_map(|part| kind.text(part)).collect();
+        let n = snapshot_text.len();
+        if total.len() <= n || !total.ends_with(snapshot_text.as_str()) {
+            // No streamed deltas before the snapshot (non-streaming turns),
+            // or the final chunk's text is unrelated — leave as accumulated.
+            continue;
+        }
+        let prefix = &total[..total.len() - n];
+        if prefix == snapshot_text {
+            keep_only_last_of_kind(acc, kind);
+        } else {
+            merge_parts_of_kind(acc, kind);
+        }
+    }
+}
+
+/// Drop every part of `kind` except the last one (the settled snapshot).
+fn keep_only_last_of_kind(acc: &mut Content, kind: StreamKind) {
+    let Some(last) = acc.parts.iter().rposition(|part| StreamKind::of(part) == Some(kind))
+    else {
+        return;
+    };
+    let mut index = 0usize;
+    acc.parts.retain(|part| {
+        let keep = StreamKind::of(part) != Some(kind) || index == last;
+        index += 1;
+        keep
+    });
+}
+
+/// Replace all parts of `kind` with one part carrying their concatenation
+/// (keeping the last seen thought signature).
+fn merge_parts_of_kind(acc: &mut Content, kind: StreamKind) {
+    let signature = acc.parts.iter().rev().find_map(|part| match part {
+        Part::Thinking { signature, .. } => signature.clone(),
+        _ => None,
+    });
+    let Some(first) = acc.parts.iter().position(|part| StreamKind::of(part) == Some(kind))
+    else {
+        return;
+    };
+    let text: String = acc.parts.iter().filter_map(|part| kind.text(part)).collect();
+    acc.parts.retain(|part| StreamKind::of(part) != Some(kind));
+    let merged = match kind {
+        StreamKind::Text => Part::Text { text },
+        StreamKind::Thinking => Part::Thinking { thinking: text, signature },
+    };
+    acc.parts.insert(first, merged);
+}
+
 /// An LLM-powered agent that orchestrates tool calls and sub-agent delegation.
 ///
 /// `LlmAgent` is the primary agent type in ADK. It sends requests to an LLM,
@@ -2623,13 +2770,12 @@ impl Agent for LlmAgent {
 
                         normalize_option_content(&mut chunk.content);
 
-                        // Accumulate content for conversation history (always needed)
+                        // Accumulate content for conversation history (always
+                        // needed). Deltas merge into the neighboring part of
+                        // the same kind; a settled chunk's parts stay
+                        // standalone — see `extend_merging`.
                         if let Some(chunk_content) = chunk.content.clone() {
-                            if let Some(ref mut acc) = accumulated_content {
-                                acc.parts.extend(chunk_content.parts);
-                            } else {
-                                accumulated_content = Some(chunk_content);
-                            }
+                            extend_merging(&mut accumulated_content, chunk_content, chunk.partial);
                         }
 
                         // For SSE/Bidi mode: yield each chunk immediately with stable event ID
@@ -2666,6 +2812,16 @@ impl Agent for LlmAgent {
                         }
                     }
 
+                    // DeepSeek-style providers repeat the complete streamed
+                    // content in the final (non-partial) chunk; both the
+                    // deltas and the snapshot landed in the accumulation.
+                    // When the snapshot restates the streamed text exactly,
+                    // keep only the snapshot — otherwise every character of
+                    // the turn would sit twice in the conversation history
+                    // (and wire converters join parts with "\n", corrupting
+                    // the replayed message).
+                    collapse_duplicated_snapshot(&mut accumulated_content, last_chunk.as_ref());
+
                     // For None mode: yield single final event with accumulated content
                     if !should_stream_to_client {
                         if let Some(content) = accumulated_content.take() {
@@ -2690,6 +2846,46 @@ impl Agent for LlmAgent {
                             .unwrap_or_default();
                         yield Ok(build_final_llm_event(
                             &llm_event_id,
+                            &invocation_id,
+                            &agent_name,
+                            &request_json,
+                            accumulated_content.as_ref(),
+                            last_chunk.as_ref(),
+                            long_running_tool_ids,
+                            iteration,
+                        ));
+                    } else if accumulated_content
+                        .as_ref()
+                        .is_some_and(|c| !c.parts.is_empty())
+                        && last_chunk.as_ref().is_some_and(|c| {
+                            c.error_code.is_none()
+                                && (c.partial
+                                    || c
+                                        .content
+                                        .as_ref()
+                                        .is_none_or(|content| content.parts.is_empty()))
+                        })
+                    {
+                        // An SSE turn whose final chunk carries no content —
+                        // the OpenAI-compatible client ends with a bare finish
+                        // chunk — never surfaces the assembled turn as a
+                        // settled event: the session history (and the
+                        // persisted log, which skips partials) would lose the
+                        // assistant message entirely. Emit the accumulated
+                        // content as the settled event, the same shape a
+                        // None-mode run produces. The id is suffixed so it
+                        // cannot collide with the persisted finish-chunk
+                        // event (both are non-partial and share the turn's
+                        // base event id).
+                        if let Some(last) = &last_chunk {
+                            final_provider_metadata = last.provider_metadata.clone();
+                        }
+                        let long_running_tool_ids = accumulated_content
+                            .as_ref()
+                            .map(&collect_long_running_ids)
+                            .unwrap_or_default();
+                        yield Ok(build_final_llm_event(
+                            &format!("{llm_event_id}_final"),
                             &invocation_id,
                             &agent_name,
                             &request_json,
@@ -3285,5 +3481,148 @@ mod run_helper_tests {
         assert_eq!(calls[1].index, 1);
         assert_eq!(calls[1].name, "second");
         assert_eq!(calls[1].function_call_id, "provider-id");
+    }
+}
+
+#[cfg(test)]
+mod stream_accumulation_tests {
+    use super::*;
+
+    fn content(parts: Vec<Part>) -> Content {
+        Content { role: "model".to_string(), parts }
+    }
+
+    fn text(s: &str) -> Part {
+        Part::Text { text: s.to_string() }
+    }
+
+    fn thinking(s: &str) -> Part {
+        Part::Thinking { thinking: s.to_string(), signature: None }
+    }
+
+    fn settled(parts: Vec<Part>) -> LlmResponse {
+        LlmResponse {
+            content: Some(content(parts)),
+            partial: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn deltas_merge_into_one_part_per_kind() {
+        let mut acc = None;
+        for delta in ["Hel", "lo ", "world"] {
+            extend_merging(&mut acc, content(vec![text(delta)]), true);
+        }
+        let acc = acc.expect("accumulated");
+        assert_eq!(acc.parts, vec![text("Hello world")]);
+    }
+
+    #[test]
+    fn thinking_and_text_stay_separate_runs() {
+        let mut acc = None;
+        extend_merging(&mut acc, content(vec![thinking("think ")]), true);
+        extend_merging(&mut acc, content(vec![thinking("hard")]), true);
+        extend_merging(&mut acc, content(vec![text("answer")]), true);
+        let acc = acc.expect("accumulated");
+        assert_eq!(acc.parts, vec![thinking("think hard"), text("answer")]);
+    }
+
+    #[test]
+    fn settled_snapshot_replacing_deltas_collapses_to_the_snapshot() {
+        // DeepSeek shape: thinking + text deltas, then a settled chunk
+        // restating the complete buffers.
+        let mut acc = None;
+        for delta in ["re", "ason"] {
+            extend_merging(&mut acc, content(vec![thinking(delta)]), true);
+        }
+        for delta in ["an", "swer"] {
+            extend_merging(&mut acc, content(vec![text(delta)]), true);
+        }
+        let settled_parts = vec![thinking("reason"), text("answer")];
+        let last = settled(settled_parts.clone());
+        // The run loop extends the settled chunk too (standalone), and the
+        // collapse step runs afterwards.
+        extend_merging(&mut acc, content(settled_parts), false);
+        collapse_duplicated_snapshot(&mut acc, Some(&last));
+        let acc = acc.expect("accumulated");
+        assert_eq!(acc.parts, vec![thinking("reason"), text("answer")]);
+    }
+
+    #[test]
+    fn settled_tail_merges_with_the_deltas() {
+        // Gemini shape: deltas, then a settled chunk carrying only the tail.
+        let mut acc = None;
+        extend_merging(&mut acc, content(vec![text("Hel")]), true);
+        extend_merging(&mut acc, content(vec![text("lo")]), true);
+        // The run loop extends the settled chunk too (standalone), and the
+        // collapse step runs afterwards.
+        extend_merging(&mut acc, content(vec![text(" world")]), false);
+        collapse_duplicated_snapshot(&mut acc, Some(&settled(vec![text(" world")])));
+        let acc = acc.expect("accumulated");
+        assert_eq!(acc.parts, vec![text("Hello world")]);
+    }
+
+    #[test]
+    fn non_streaming_snapshot_is_untouched() {
+        let mut acc = None;
+        extend_merging(&mut acc, content(vec![text("whole")]), false);
+        collapse_duplicated_snapshot(&mut acc, Some(&settled(vec![text("whole")])));
+        let acc = acc.expect("accumulated");
+        assert_eq!(acc.parts, vec![text("whole")]);
+    }
+
+    #[test]
+    fn function_call_parts_never_merge_or_drop() {
+        let call = || Part::FunctionCall {
+            name: "tool".to_string(),
+            args: serde_json::json!({"k": 1}),
+            id: Some("call-1".to_string()),
+            thought_signature: None,
+        };
+        // DeepSeek tool-turn shape: thinking deltas, settled chunk with the
+        // full reasoning + the function call.
+        let mut acc = None;
+        extend_merging(&mut acc, content(vec![thinking("pl")]), true);
+        extend_merging(&mut acc, content(vec![thinking("an")]), true);
+        let settled_content = content(vec![thinking("plan"), call()]);
+        extend_merging(&mut acc, settled_content.clone(), false);
+        collapse_duplicated_snapshot(&mut acc, Some(&settled(vec![thinking("plan"), call()])));
+        let acc = acc.expect("accumulated");
+        assert_eq!(acc.parts, vec![thinking("plan"), call()]);
+    }
+
+    #[test]
+    fn unrelated_settled_text_is_left_as_accumulated() {
+        // A settled chunk whose text is not the streamed run's tail or
+        // restatement (defensive shape) keeps everything, as before.
+        let mut acc = None;
+        extend_merging(&mut acc, content(vec![text("a")]), true);
+        extend_merging(&mut acc, content(vec![text("b")]), true);
+        let before = acc.clone().expect("accumulated");
+        collapse_duplicated_snapshot(&mut acc, Some(&settled(vec![text("zzz")])));
+        assert_eq!(acc.expect("accumulated").parts, before.parts);
+    }
+
+    #[test]
+    fn merged_thinking_keeps_the_last_signature() {
+        let mut acc = None;
+        extend_merging(&mut acc, content(vec![thinking("a")]), true);
+        extend_merging(
+            &mut acc,
+            content(vec![Part::Thinking {
+                thinking: "b".to_string(),
+                signature: Some("sig".to_string()),
+            }]),
+            true,
+        );
+        let acc = acc.expect("accumulated");
+        assert_eq!(
+            acc.parts,
+            vec![Part::Thinking {
+                thinking: "ab".to_string(),
+                signature: Some("sig".to_string()),
+            }]
+        );
     }
 }
