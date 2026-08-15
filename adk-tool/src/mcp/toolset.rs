@@ -657,6 +657,15 @@ where
     }
 }
 
+/// Sanitize a toolset/server name for embedding in an exposed tool name
+/// (`mcp__{server}__{tool}`): keep `[A-Za-z0-9_-]`, replace anything else with
+/// `_` (provider function-name schemas reject colons, dots, spaces, CJK, ...).
+fn sanitize_name_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
 #[async_trait]
 impl<S> Toolset for McpToolset<S>
 where
@@ -723,7 +732,8 @@ where
         for mcp_tool in mcp_tools {
             let tool_name = mcp_tool.name.to_string();
 
-            // Apply filter if present
+            // Apply filter if present (raw MCP names — the public filter
+            // contract; prefixing below must not change filter semantics)
             if let Some(ref filter) = self.tool_filter
                 && !filter(&tool_name)
             {
@@ -737,9 +747,29 @@ where
                 schema = ?input_schema,
                 "registering MCP tool with raw schema"
             );
+            // Provenance: when the toolset is named, expose the tool as
+            // `mcp__{sanitized server}__{raw tool}` (Claude-Code-style) and
+            // prefix the description with the server identity, so the model,
+            // event consumers, and QoS stats can attribute the tool to its MCP
+            // server. `remote_name` keeps the raw wire name — the MCP server
+            // only knows its own names. An empty toolset name changes nothing.
+            let raw_description =
+                mcp_tool.description.map(|d| d.to_string()).unwrap_or_default();
+            let (name, remote_name, description) = if self.name.is_empty() {
+                (tool_name.clone(), tool_name, raw_description)
+            } else {
+                let exposed = format!("mcp__{}__{tool_name}", sanitize_name_segment(&self.name));
+                let description = if raw_description.is_empty() {
+                    format!("[mcp:{}]", self.name)
+                } else {
+                    format!("[mcp:{}] {raw_description}", self.name)
+                };
+                (exposed, tool_name, description)
+            };
             let adk_tool = McpTool {
-                name: tool_name,
-                description: mcp_tool.description.map(|d| d.to_string()).unwrap_or_default(),
+                name,
+                remote_name,
+                description,
                 input_schema,
                 output_schema: mcp_tool.output_schema.map(|s| Value::Object(s.as_ref().clone())),
                 client: self.client.clone(),
@@ -929,6 +959,10 @@ where
     S: rmcp::service::Service<RoleClient> + Send + Sync + 'static,
 {
     name: String,
+    /// Wire name the MCP server knows this tool by. Differs from `name` when
+    /// the toolset is named: `name` carries the `mcp__{server}__` prefix for
+    /// attribution, while requests must use the raw server-side name.
+    remote_name: String,
     description: String,
     input_schema: Option<Value>,
     output_schema: Option<Value>,
@@ -1187,7 +1221,9 @@ where
     }
 
     async fn execute(&self, _ctx: Arc<dyn ToolContext>, args: Value) -> Result<Value> {
-        let mut params = CallToolRequestParams::new(self.name.clone());
+        // Wire requests use the server-side name; `name` is the prefixed
+        // exposure (see `McpToolset::tools`).
+        let mut params = CallToolRequestParams::new(self.remote_name.clone());
         if !(args.is_null() || args == json!({})) {
             match args {
                 Value::Object(map) => params = params.with_arguments(map),
@@ -1201,7 +1237,7 @@ where
             CallToolResponse::Complete(result) => result,
             CallToolResponse::Task(created) => {
                 let task_id = created.task.task_id.clone();
-                debug!(tool = self.name, task_id, "MCP server materialized a task");
+                debug!(tool = self.remote_name, task_id, "MCP server materialized a task");
                 return self
                     .poll_task(created.task)
                     .await
@@ -1211,19 +1247,19 @@ where
                 return Err(AdkError::tool(format!(
                     "MCP tool '{}' asked for mid-call input (SEP-2322), which this client does not \
                      drive yet. Configure the server to complete the call in one round.",
-                    self.name
+                    self.remote_name
                 )));
             }
             response => {
                 return Err(AdkError::tool(format!(
                     "MCP tool '{}' returned an unsupported response: {response:?}",
-                    self.name
+                    self.remote_name
                 )));
             }
         };
 
         if result.is_error.unwrap_or(false) {
-            let mut error_msg = format!("MCP tool '{}' execution failed", self.name);
+            let mut error_msg = format!("MCP tool '{}' execution failed", self.remote_name);
             for content in &result.content {
                 if let Some(text_content) = content.as_text() {
                     error_msg.push_str(": ");
@@ -1235,7 +1271,7 @@ where
         }
 
         call_tool_result_to_adk_value(&result).map_err(|error| {
-            AdkError::tool(format!("MCP tool '{}' result invalid: {error}", self.name))
+            AdkError::tool(format!("MCP tool '{}' result invalid: {error}", self.remote_name))
         })
     }
 }
