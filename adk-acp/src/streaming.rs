@@ -31,8 +31,14 @@ pub enum OutputChunk {
     Thought(String),
     /// A tool call was initiated (e.g., "Creating file app.rs").
     ToolCall {
+        /// The tool-call identifier; [`ToolUpdate`](Self::ToolUpdate) chunks
+        /// correlate back to this id (parallel calls must be matched by it).
+        id: String,
         /// Human-readable title of the operation.
         title: String,
+        /// MCP server attribution (`_meta.mcp_server`) when the tool comes
+        /// from an MCP toolset exposed as `mcp__{server}__{tool}`.
+        server: Option<String>,
     },
     /// A tool call completed.
     ToolCallComplete {
@@ -54,6 +60,8 @@ pub enum OutputChunk {
         title: Option<String>,
         /// Human-readable text summary extracted from the update content, if any.
         content: Option<String>,
+        /// MCP server attribution (`_meta.mcp_server`), when reported.
+        server: Option<String>,
         /// Absolute file paths the tool reported affecting.
         locations: Vec<String>,
     },
@@ -328,7 +336,14 @@ async fn stream_prompt_inner(
 /// The text paths (`AgentMessageChunk` → [`OutputChunk::Text`],
 /// `AgentThoughtChunk` → [`OutputChunk::Thought`]) are preserved exactly as they
 /// were before richer updates were surfaced (see design property P12).
-fn map_update(update: SessionUpdate) -> Option<OutputChunk> {
+/// Map an ACP `SessionUpdate` notification to an [`OutputChunk`].
+///
+/// Public so HTTP-bridge style consumers (e.g. `agent_client_protocol_http`
+/// clients that receive raw notifications) can reuse the exact stdio-path
+/// semantics: text/thought chunks, tool-call start, tool-call updates
+/// (status/kind/title/content/locations), and usage. Unmapped variants
+/// yield `None`.
+pub fn map_update(update: SessionUpdate) -> Option<OutputChunk> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
             ContentBlock::Text(text_content) => {
@@ -342,9 +357,11 @@ fn map_update(update: SessionUpdate) -> Option<OutputChunk> {
             }
             _ => None,
         },
-        SessionUpdate::ToolCall(tool_call) => {
-            Some(OutputChunk::ToolCall { title: tool_call.title.to_string() })
-        }
+        SessionUpdate::ToolCall(tool_call) => Some(OutputChunk::ToolCall {
+            id: tool_call.tool_call_id.to_string(),
+            title: tool_call.title.to_string(),
+            server: meta_mcp_server(&tool_call.meta),
+        }),
         SessionUpdate::ToolCallUpdate(update) => Some(map_tool_call_update(update)),
         SessionUpdate::UsageUpdate(usage) => Some(OutputChunk::Usage {
             used: usage.used,
@@ -360,7 +377,7 @@ fn map_update(update: SessionUpdate) -> Option<OutputChunk> {
 /// surfacing the status, kind, title, extracted content text, and affected
 /// file locations while preserving the tool-call id correlation.
 fn map_tool_call_update(update: ToolCallUpdate) -> OutputChunk {
-    let ToolCallUpdate { tool_call_id, fields, .. } = update;
+    let ToolCallUpdate { tool_call_id, fields, meta, .. } = update;
 
     let locations = fields
         .locations
@@ -375,8 +392,19 @@ fn map_tool_call_update(update: ToolCallUpdate) -> OutputChunk {
         kind: fields.kind.map(tool_kind_str).map(str::to_string),
         title: fields.title,
         content: extract_tool_content_text(fields.content.as_deref()),
+        server: meta_mcp_server(&meta),
         locations,
     }
+}
+
+/// Read the `_meta.mcp_server` attribution from an ACP tool-call event, if the
+/// agent set one. Key is private to this ADK implementation (the spec reserves
+/// `_meta` for implementation-defined extensions).
+fn meta_mcp_server(meta: &Option<agent_client_protocol::schema::v1::Meta>) -> Option<String> {
+    meta.as_ref()
+        .and_then(|meta| meta.get("mcp_server"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// Extract a human-readable text summary from tool-call update content blocks.
@@ -474,7 +502,11 @@ mod tests {
         let update = SessionUpdate::ToolCall(ToolCall::new("tc-1", "Reading app.rs"));
 
         match map_update(update) {
-            Some(OutputChunk::ToolCall { title }) => assert_eq!(title, "Reading app.rs"),
+            Some(OutputChunk::ToolCall { id, title, server }) => {
+                assert_eq!(id, "tc-1");
+                assert_eq!(title, "Reading app.rs");
+                assert!(server.is_none(), "no _meta.mcp_server was set");
+            }
             other => panic!("expected ToolCall chunk, got {other:?}"),
         }
     }
@@ -492,12 +524,13 @@ mod tests {
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("tc-1", fields));
 
         match map_update(update) {
-            Some(OutputChunk::ToolUpdate { id, status, kind, title, content, locations }) => {
+            Some(OutputChunk::ToolUpdate { id, status, kind, title, content, server, locations }) => {
                 assert_eq!(id, "tc-1");
                 assert_eq!(status.as_deref(), Some("completed"));
                 assert_eq!(kind.as_deref(), Some("edit"));
                 assert_eq!(title.as_deref(), Some("Edited app.rs"));
                 assert_eq!(content.as_deref(), Some("done"));
+                assert!(server.is_none(), "no _meta.mcp_server was set");
                 assert_eq!(locations, vec!["/tmp/app.rs".to_string()]);
             }
             other => panic!("expected ToolUpdate chunk, got {other:?}"),
@@ -511,12 +544,13 @@ mod tests {
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new("tc-9", ToolCallUpdateFields::new()));
 
         match map_update(update) {
-            Some(OutputChunk::ToolUpdate { id, status, kind, title, content, locations }) => {
+            Some(OutputChunk::ToolUpdate { id, status, kind, title, content, server, locations }) => {
                 assert_eq!(id, "tc-9");
                 assert!(status.is_none());
                 assert!(kind.is_none());
                 assert!(title.is_none());
                 assert!(content.is_none());
+                assert!(server.is_none());
                 assert!(locations.is_empty());
             }
             other => panic!("expected ToolUpdate chunk, got {other:?}"),

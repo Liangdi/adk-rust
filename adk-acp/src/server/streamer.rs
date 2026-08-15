@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use adk_core::{Content, Event, FunctionResponseData, Part, UsageMetadata};
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Cost, Plan, PlanEntry, SessionUpdate, TextContent, ToolCall,
-    ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind, UsageUpdate,
+    ContentBlock, ContentChunk, Cost, Meta, Plan, PlanEntry, SessionUpdate, TextContent,
+    ToolCall, ToolCallContent, ToolCallLocation, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 
 /// Converts the typed event stream produced by the ADK-Rust Runner into ACP
@@ -41,15 +41,18 @@ impl ResponseStreamer {
         if let Some(content) = event.content() {
             // A final (non-partial) agent text event is the full reply; in a
             // streaming turn it would re-send text the partials already
-            // delivered. Suppress its message chunk unless the caller asked for
-            // it (the non-streaming / replay path).
+            // delivered. Suppress its message chunks unless the caller asked
+            // for them (the non-streaming / replay path). Suppression is
+            // part-scoped: it must only drop the duplicated text/thinking
+            // chunks. Tool-call parts live solely in final events (streamed
+            // tool calls are accumulated and emitted once at finish), so a
+            // whole-event suppression would hide every ToolCall/ToolCallUpdate
+            // on any turn that streamed a partial first.
             let partial = event.llm_response.partial;
             let suppress_agent_text = !partial
                 && !content.role.eq_ignore_ascii_case("user")
                 && !emit_final_agent_text;
-            if !suppress_agent_text {
-                Self::map_content(content, &mut updates);
-            }
+            Self::map_content(content, suppress_agent_text, &mut updates);
         }
         if let Some(usage) = &event.llm_response.usage_metadata {
             updates.push(SessionUpdate::UsageUpdate(map_usage(usage)));
@@ -57,7 +60,11 @@ impl ResponseStreamer {
         updates
     }
 
-    fn map_content(content: &Content, updates: &mut Vec<SessionUpdate>) {
+    fn map_content(
+        content: &Content,
+        suppress_message_chunks: bool,
+        updates: &mut Vec<SessionUpdate>,
+    ) {
         for part in &content.parts {
             match part {
                 Part::Text { text } if text.is_empty() => {}
@@ -65,6 +72,10 @@ impl ResponseStreamer {
                 | Part::InlineData { .. }
                 | Part::FileData { .. }
                 | Part::EmbeddedResource { .. } => {
+                    // Duplicated by partials on suppressed final events.
+                    if suppress_message_chunks {
+                        continue;
+                    }
                     if let Some(block) = crate::content::part_to_block(part) {
                         let chunk = ContentChunk::new(block);
                         if content.role.eq_ignore_ascii_case("user") {
@@ -75,18 +86,25 @@ impl ResponseStreamer {
                     }
                 }
                 Part::Thinking { thinking, .. } if !thinking.is_empty() => {
+                    // Same duplicate-suppression rule as text: reasoning
+                    // partials already delivered the thinking content.
+                    if suppress_message_chunks {
+                        continue;
+                    }
                     updates.push(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
                         ContentBlock::Text(TextContent::new(thinking.clone())),
                     )));
                 }
                 Part::FunctionCall { name, args, id, .. } => {
                     let call_id = id.clone().unwrap_or_else(|| format!("{name}-call"));
-                    updates.push(SessionUpdate::ToolCall(
-                        ToolCall::new(call_id, name.clone())
-                            .kind(infer_tool_kind(name))
-                            .status(ToolCallStatus::InProgress)
-                            .raw_input(args.clone()),
-                    ));
+                    let mut tool_call = ToolCall::new(call_id, name.clone())
+                        .kind(infer_tool_kind(name))
+                        .status(ToolCallStatus::InProgress)
+                        .raw_input(args.clone());
+                    if let Some(server) = mcp_server_from_tool_name(name) {
+                        tool_call = tool_call.meta(mcp_server_meta(&server));
+                    }
+                    updates.push(SessionUpdate::ToolCall(tool_call));
                 }
                 Part::FunctionResponse { function_response, id, .. } => {
                     let call_id =
@@ -103,8 +121,11 @@ impl ResponseStreamer {
                     if !locations.is_empty() {
                         fields = fields.locations(locations);
                     }
-                    updates
-                        .push(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call_id, fields)));
+                    let mut update = ToolCallUpdate::new(call_id, fields);
+                    if let Some(server) = mcp_server_from_tool_name(&function_response.name) {
+                        update = update.meta(mcp_server_meta(&server));
+                    }
+                    updates.push(SessionUpdate::ToolCallUpdate(update));
                 }
                 _ => {}
             }
@@ -119,6 +140,27 @@ impl ResponseStreamer {
 /// model's context-window size, so `size` is left at `0` (unknown) rather than
 /// fabricating a value. Cost is populated only when ADK reports it; ADK cost is
 /// an estimate in USD.
+/// Extract the MCP server segment from an exposed tool name of the form
+/// `mcp__{server}__{tool}` (see `McpToolset::tools`). Returns `None` for
+/// non-MCP (native) tool names.
+fn mcp_server_from_tool_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some(server.to_string())
+}
+
+/// `_meta` payload carrying MCP server attribution for a tool-call event.
+/// The key is private to this ADK implementation (the ACP spec reserves
+/// `_meta` and makes no assumptions about its contents).
+fn mcp_server_meta(server: &str) -> Meta {
+    let mut meta = Meta::new();
+    meta.insert("mcp_server".to_string(), serde_json::Value::String(server.to_string()));
+    meta
+}
+
 fn map_usage(usage: &UsageMetadata) -> UsageUpdate {
     let used = u64::try_from(usage.total_token_count.max(0)).unwrap_or(0);
     let mut update = UsageUpdate::new(used, 0);
