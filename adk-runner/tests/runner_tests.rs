@@ -808,3 +808,93 @@ async fn test_runner_runs_to_completion_without_interrupt() {
     }
     assert_eq!(count, 3, "agent should emit exactly max_ticks events when not interrupted");
 }
+
+// ── Streaming deltas must not accumulate in the session event list ───────
+
+/// Yields one partial delta, checkpoints the session-derived history size,
+/// then yields the settled event. Streaming deltas share the turn's event id
+/// and are restated by the settled event, so the in-memory event list (like
+/// the persisted log) must skip them — otherwise every delta is retained for
+/// the whole invocation.
+struct StreamingDeltaAgent {
+    history_sizes: Arc<Mutex<Vec<usize>>>,
+}
+
+#[async_trait]
+impl Agent for StreamingDeltaAgent {
+    fn name(&self) -> &str {
+        "streaming_delta_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Emits a partial delta, then a settled event"
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        &[]
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let history_sizes = self.history_sizes.clone();
+        Ok(Box::pin(async_stream::stream! {
+            let mut delta = Event::new("guard-test-invocation");
+            delta.author = "streaming_delta_agent".to_string();
+            delta.llm_response.content = Some(Content {
+                role: "model".to_string(),
+                parts: vec![Part::Text { text: "dri".to_string() }],
+            });
+            delta.llm_response.partial = true;
+            delta.llm_response.turn_complete = false;
+            yield Ok(delta);
+
+            // Observed after the delta was consumed by the runner loop:
+            // the history derived from the session events must not contain it.
+            let history = ctx.session().conversation_history_scoped(None, ctx.branch());
+            history_sizes.lock().unwrap().push(history.len());
+
+            let mut settled = Event::new("guard-test-invocation");
+            settled.author = "streaming_delta_agent".to_string();
+            settled.llm_response.content = Some(Content {
+                role: "model".to_string(),
+                parts: vec![Part::Text { text: "drifting".to_string() }],
+            });
+            settled.llm_response.partial = false;
+            settled.llm_response.turn_complete = true;
+            yield Ok(settled);
+        }))
+    }
+}
+
+#[tokio::test]
+async fn runner_session_history_skips_partial_streaming_deltas() {
+    let history_sizes: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let agent = Arc::new(StreamingDeltaAgent { history_sizes: history_sizes.clone() });
+
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(agent as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let content = Content {
+        role: "user".to_string(),
+        parts: vec![Part::Text { text: "go".to_string() }],
+    };
+    let mut stream = runner
+        .run(UserId::new("u1").unwrap(), SessionId::new("s1").unwrap(), content)
+        .await
+        .unwrap();
+
+    use futures::StreamExt;
+    while let Some(result) = stream.next().await {
+        result.unwrap();
+    }
+
+    let sizes = history_sizes.lock().unwrap();
+    assert_eq!(sizes.len(), 1, "one checkpoint after the delta");
+    assert_eq!(
+        sizes[0], 1,
+        "history should hold only the user echo — the partial delta must not          enter the session event list (unguarded it would be 2)"
+    );
+}

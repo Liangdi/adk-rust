@@ -860,8 +860,17 @@ impl Runner {
                             ctx.mutable_session().apply_state_delta(&event.actions.state_delta);
                         }
 
-                        // Also add the event to the mutable session's event list
-                        ctx.mutable_session().append_event(event.clone());
+                        // Also add the event to the mutable session's event
+                        // list — same rule as the persistence path below:
+                        // streaming deltas share one event id and the settled
+                        // event carries the complete content. Appending every
+                        // delta here retained each one for the whole
+                        // invocation (each carrying a copy of the serialized
+                        // request), which grew memory by MBs per second on
+                        // reasoning-heavy turns.
+                        if !event.llm_response.partial {
+                            ctx.mutable_session().append_event(event.clone());
+                        }
 
                         // Append event to session service (persistent storage)
                         // Skip partial streaming chunks — only persist the final

@@ -180,9 +180,14 @@ impl Llm for AzureAIClient {
 
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer = buffer[line_end + 1..].to_string();
+                    // Lines are cut at a consumed offset and the buffer is
+                    // drained once per network read — re-slicing the remainder
+                    // per line copied the whole buffer for every line
+                    // (quadratic per read).
+                    let mut consumed = 0usize;
+                    while let Some(line_end) = buffer[consumed..].find('\n') {
+                        let line = buffer[consumed..consumed + line_end].trim().to_string();
+                        consumed += line_end + 1;
 
                         if line.is_empty() || line == "data: [DONE]" {
                             continue;
@@ -242,6 +247,7 @@ impl Llm for AzureAIClient {
                             }
                         }
                     }
+                    buffer.drain(..consumed);
                 }
             } else {
                 let response_text = response.text().await

@@ -124,10 +124,15 @@ fn build_partial_llm_event(
     let mut event = Event::with_id(event_id, invocation_id);
     event.author = agent_name.to_string();
     event.step = step;
-    event.llm_request = Some(request_json.to_string());
-    event
-        .provider_metadata
-        .insert("gcp.vertex.agent.llm_request".to_string(), request_json.to_string());
+    // This builder runs once per streaming delta, and each copy of the
+    // serialized request is the size of the WHOLE conversation. Attaching it
+    // to every delta made one reasoning-heavy turn emit hundreds of
+    // full-request copies, which the runner retained for the invocation —
+    // MBs of growth per streamed second. Only the settled chunk (partial ==
+    // false, once per turn) carries the request as the durable record.
+    if !chunk.partial {
+        event.llm_request = Some(request_json.to_string());
+    }
     event.provider_metadata.insert(
         "gcp.vertex.agent.llm_response".to_string(),
         serde_json::to_string(chunk).unwrap_or_default(),
@@ -161,10 +166,10 @@ fn build_final_llm_event(
     let mut event = Event::with_id(event_id, invocation_id);
     event.author = agent_name.to_string();
     event.step = step;
+    // The settled event keeps ONE copy of the request (the durable record);
+    // the `gcp.vertex.agent.llm_request` metadata duplicate was removed —
+    // it repeated `event.llm_request` verbatim with no readers.
     event.llm_request = Some(request_json.to_string());
-    event
-        .provider_metadata
-        .insert("gcp.vertex.agent.llm_request".to_string(), request_json.to_string());
     event.llm_response.content = content.cloned();
     event.llm_response.partial = false;
     event.llm_response.turn_complete = true;
@@ -2529,7 +2534,6 @@ impl Agent for LlmAgent {
                         last_interaction_id = cached_response.interaction_id.clone();
                     }
                     cached_event.llm_request = Some(serde_json::to_string(&request).unwrap_or_default());
-                    cached_event.provider_metadata.insert("gcp.vertex.agent.llm_request".to_string(), serde_json::to_string(&request).unwrap_or_default());
                     cached_event.provider_metadata.insert("gcp.vertex.agent.llm_response".to_string(), serde_json::to_string(&cached_response).unwrap_or_default());
 
                     // Populate long_running_tool_ids for function calls from long-running tools
