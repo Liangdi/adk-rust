@@ -10,10 +10,10 @@ description = "Demonstrates ADK-Rust realtime voice capabilities with a full web
 [dependencies]
 # ADK crates (path deps to workspace)
 adk-realtime = { path = "../../adk-realtime", features = ["openai", "gemini", "integration"] }
-adk-core = { path = "../../adk-core" }
-adk-session = { path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
 adk-memory = { path = "../../adk-memory", features = ["graph-memory"] }
-adk-tool = { path = "../../adk-tool", features = ["graph-memory-tools"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool", features = ["graph-memory-tools"] }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }

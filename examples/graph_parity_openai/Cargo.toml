@@ -7,11 +7,11 @@ publish = false
 [workspace]
 
 [dependencies]
-adk-agent = { path = "../../adk-agent" }
-adk-core = { path = "../../adk-core" }
+adk-agent = { package = "agentx-adk-agent", path = "../../adk-agent" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 adk-graph = { path = "../../adk-graph", features = ["sqlite"] }
-adk-model = { path = "../../adk-model", features = ["openai"] }
-adk-tool = { path = "../../adk-tool" }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["openai"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool" }
 anyhow = "1.0"
 dotenvy = "0.15"
 futures = "0.3"

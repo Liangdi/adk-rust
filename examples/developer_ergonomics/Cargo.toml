@@ -15,13 +15,13 @@ name = "llm_demo"
 path = "src/llm_demo.rs"
 
 [dependencies]
-adk-rust = { path = "../../adk-rust", features = ["standard"] }
-adk-core = { path = "../../adk-core" }
-adk-agent = { path = "../../adk-agent" }
-adk-runner = { path = "../../adk-runner" }
-adk-tool = { path = "../../adk-tool" }
-adk-session = { path = "../../adk-session" }
-adk-artifact = { path = "../../adk-artifact" }
+adk-rust = { package = "agentx-adk-rust", path = "../../adk-rust", features = ["standard"] }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-agent = { package = "agentx-adk-agent", path = "../../adk-agent" }
+adk-runner = { package = "agentx-adk-runner", path = "../../adk-runner" }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
+adk-artifact = { package = "agentx-adk-artifact", path = "../../adk-artifact" }
 async-trait = "0.1"
 async-stream = "0.3"
 anyhow = "1.0"

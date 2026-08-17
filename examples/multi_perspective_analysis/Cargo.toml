@@ -9,7 +9,7 @@ description = "Three LLM analysts run concurrently under ParallelAgent, with per
 
 [dependencies]
 # The umbrella crate with the standard tier: agents, models, runner, sessions.
-adk-rust = { path = "../../adk-rust", features = ["standard"] }
+adk-rust = { package = "agentx-adk-rust", path = "../../adk-rust", features = ["standard"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 dotenvy = "0.15"

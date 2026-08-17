@@ -42,7 +42,7 @@ pub use discovery::{
     discover_skill_files_with_extras,
 };
 pub use error::{SkillError, SkillResult};
-pub use index::{load_skill_index, load_skill_index_with_extras};
+pub use index::{load_skill_index, load_skill_index_scoped, load_skill_index_with_extras};
 pub use injector::{
     SkillInjector, SkillInjectorConfig, apply_skill_injection, select_skill_prompt_block,
 };

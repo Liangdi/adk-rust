@@ -9,9 +9,9 @@ publish = false
 [dependencies]
 # ADK crates (path deps to workspace)
 adk-server = { path = "../../adk-server", features = ["yaml-agent"] }
-adk-core = { path = "../../adk-core" }
-adk-tool = { path = "../../adk-tool" }
-adk-model = { path = "../../adk-model", features = ["gemini"] }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool" }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["gemini"] }
 
 # Common dependencies
 tokio = { version = "1.40", features = ["full"] }

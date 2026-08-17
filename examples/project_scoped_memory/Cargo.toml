@@ -11,7 +11,7 @@ name = "project-scoped-memory"
 path = "src/main.rs"
 
 [dependencies]
-adk-core = { path = "../../adk-core" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 adk-memory = { path = "../../adk-memory" }
 tokio = { version = "1", features = ["full"] }
 chrono = "0.4"

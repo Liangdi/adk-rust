@@ -15,9 +15,9 @@ name = "resources-client"
 path = "src/client.rs"
 
 [dependencies]
-adk-core = { path = "../../adk-core" }
-adk-rust = { path = "../../adk-rust", features = ["standard"] }
-adk-tool = { path = "../../adk-tool", features = ["mcp"] }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-rust = { package = "agentx-adk-rust", path = "../../adk-rust", features = ["standard"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool", features = ["mcp"] }
 adk-cli = { path = "../../adk-cli" }
 rmcp = { version = "3.1", features = [
     "server", "client",

@@ -1,5 +1,5 @@
 [package]
-name = "adk-core"
+name = "agentx-adk-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -421,8 +421,22 @@ impl Runner {
                     injector.policy(),
                     injector.max_injected_chars(),
                 ) {
-                    selected_skill_name = matched.skill.name;
-                    selected_skill_id = matched.skill.id;
+                    selected_skill_name.clone_from(&matched.skill.name);
+                    selected_skill_id.clone_from(&matched.skill.id);
+                    // Stream-only skill/selected event: surfaces the injection
+                    // to consumers (TUI row, web event log) without persisting
+                    // it to the session — the session's own user event already
+                    // carries the injected block, and an extra persisted event
+                    // would leak into the model's resume history.
+                    let mut skill_event = adk_core::Event::new(invocation_id.clone());
+                    skill_event.author = adk_core::SKILL_AUTHOR.to_string();
+                    skill_event.step = 1; // max(1) normalization in consumers
+                    skill_event.llm_response.content =
+                        Some(Content::new("skill").with_text(matched.skill.name.clone()));
+                    skill_event.llm_response.provider_metadata = Some(serde_json::json!({
+                        adk_core::SKILL_ID_METADATA_KEY: matched.skill.id.clone(),
+                    }));
+                    yield Ok(skill_event);
                 }
 
             let mut invocation_ctx = match InvocationContext::new_typed(

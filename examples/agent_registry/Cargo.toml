@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 # ADK crates (path deps to workspace)
 adk-server = { path = "../../adk-server", features = ["agent-registry"] }
-adk-core = { path = "../../adk-core" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 
 # HTTP client for calling the registry REST API
 reqwest = { version = "0.12", features = ["json"] }

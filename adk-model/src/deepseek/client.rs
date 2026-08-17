@@ -216,6 +216,31 @@ impl Llm for DeepSeekClient {
         let api_url = self.api_url();
         let api_key = self.config.api_key.clone();
         let chat_request = self.build_request(&request, stream);
+        // Debugging aid: point ADK_DUMP_REQUESTS at a directory to capture the
+        // exact wire request (pretty JSON) for every DeepSeek call. Best-effort
+        // and silent on failure. Pair with agentx's
+        // scripts/audit_llm_messages.py, which audits tool_calls/tool_call_id
+        // pairing in the dump — pairing violations are what DeepSeek rejects
+        // with "insufficient tool messages following tool_calls message".
+        if let Ok(dir) = std::env::var("ADK_DUMP_REQUESTS") {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default();
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let path = format!("{dir}/deepseek-{stamp}-{seq}.json");
+                match serde_json::to_vec_pretty(&chat_request) {
+                    Ok(body) => {
+                        if std::fs::write(&path, body).is_ok() {
+                            tracing::info!("dumped DeepSeek wire request to {path}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("failed to serialize DeepSeek request dump: {e}"),
+                }
+            }
+        }
         let client = self.client.clone();
         let retry_config = self.retry_config.clone();
 

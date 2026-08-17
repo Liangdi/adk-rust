@@ -8,10 +8,10 @@ description = "Runs the ADK-Rust CodeActAgent (CodeAct loop) against a self-cont
 [workspace]
 
 [dependencies]
-adk-core = { path = "../../adk-core" }
-adk-agent = { path = "../../adk-agent", features = ["codeact"] }
-adk-runner = { path = "../../adk-runner" }
-adk-session = { path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-agent = { package = "agentx-adk-agent", path = "../../adk-agent", features = ["codeact"] }
+adk-runner = { package = "agentx-adk-runner", path = "../../adk-runner" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
 tokio = { version = "1.40", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"

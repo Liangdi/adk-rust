@@ -6,7 +6,7 @@ publish = false
 
 # Full tier — everything: enterprise + audio, code, sandbox.
 [dependencies]
-adk-rust = { path = "../../../adk-rust", features = ["full"] }
+adk-rust = { package = "agentx-adk-rust", path = "../../../adk-rust", features = ["full"] }
 tokio = { version = "1.40", features = ["full"] }
 anyhow = "1.0"
 dotenvy = "0.15"

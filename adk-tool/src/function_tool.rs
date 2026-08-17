@@ -80,6 +80,15 @@ impl FunctionTool {
         self
     }
 
+    /// Set the parameters JSON Schema from a pre-built value — the dynamic
+    /// counterpart of [`FunctionTool::with_parameters_schema`], for tools
+    /// whose schema comes from data (a plugin manifest, a config file)
+    /// rather than a static type.
+    pub fn with_parameters_json(mut self, schema: Value) -> Self {
+        self.parameters_schema = Some(schema);
+        self
+    }
+
     /// Derive the response JSON Schema from a type implementing `JsonSchema`.
     pub fn with_response_schema<T>(mut self) -> Self
     where

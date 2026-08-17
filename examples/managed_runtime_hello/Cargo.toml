@@ -9,8 +9,8 @@ description = "Smoke test for the managed agent runtime — runs fixture F-1 end
 
 [dependencies]
 adk-managed = { path = "../../adk-managed" }
-adk-session = { path = "../../adk-session" }
-adk-core = { path = "../../adk-core" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

@@ -10,8 +10,8 @@ openai = ["adk-rust/openai"]
 anthropic = ["adk-rust/anthropic"]
 
 [dependencies]
-adk-rust = { path = "../../../adk-rust" }
-adk-tool = { path = "../../../adk-tool" }
+adk-rust = { package = "agentx-adk-rust", path = "../../../adk-rust" }
+adk-tool = { package = "agentx-adk-tool", path = "../../../adk-tool" }
 tokio = { version = "1.40", features = ["full"] }
 anyhow = "1.0"
 dotenvy = "0.15"

@@ -1,5 +1,5 @@
 use crate::error::SkillResult;
-use crate::index::{load_skill_index, load_skill_index_with_extras};
+use crate::index::{load_skill_index, load_skill_index_scoped, load_skill_index_with_extras};
 use crate::model::{SelectionPolicy, SkillIndex, SkillMatch};
 use crate::select::select_skills;
 use adk_core::{Content, Part};
@@ -17,6 +17,13 @@ pub struct SkillInjectorConfig {
     pub global_skills_dir: Option<PathBuf>,
     /// Additional directories to scan for skills.
     pub extra_paths: Vec<PathBuf>,
+    /// Whether to scan the whole tree under `root` for convention files
+    /// (AGENTS.md/CLAUDE.md/SOUL.md/...). Defaults to `true`. Disable for
+    /// huge roots (e.g. a home directory) where the full-tree walk is
+    /// prohibitively expensive; only the whitelisted skill directories
+    /// (`.skills/`, `.claude/skills/`, `.agents/skills/`) plus
+    /// `extra_paths`/`global_skills_dir` are indexed then.
+    pub scan_convention_files: bool,
 }
 
 impl Default for SkillInjectorConfig {
@@ -26,6 +33,7 @@ impl Default for SkillInjectorConfig {
             max_injected_chars: 2000,
             global_skills_dir: None,
             extra_paths: Vec::new(),
+            scan_convention_files: true,
         }
     }
 }
@@ -42,7 +50,9 @@ impl SkillInjector {
         if let Some(ref global) = config.global_skills_dir {
             extra_dirs.push(global.clone());
         }
-        let index = if extra_dirs.is_empty() {
+        let index = if !config.scan_convention_files {
+            load_skill_index_scoped(root, &extra_dirs, false)?
+        } else if extra_dirs.is_empty() {
             load_skill_index(root)?
         } else {
             load_skill_index_with_extras(root, &extra_dirs)?
@@ -189,5 +199,27 @@ mod tests {
         let injected = content.parts[0].text().unwrap();
         assert!(injected.contains("[skill:search]"));
         assert!(injected.contains("Use rg first."));
+    }
+
+    #[test]
+    fn from_root_without_convention_scan_skips_convention_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join(".skills")).unwrap();
+        fs::write(root.join("AGENTS.md"), "# Repo Instructions\n").unwrap();
+        fs::write(
+            root.join(".skills/search.md"),
+            "---\nname: search\ndescription: Search code\n---\nUse rg first.",
+        )
+        .unwrap();
+
+        let injector = SkillInjector::from_root(
+            root,
+            SkillInjectorConfig { scan_convention_files: false, ..Default::default() },
+        )
+        .unwrap();
+
+        assert_eq!(injector.index().len(), 1);
+        assert!(injector.index().find_by_name("search").is_some());
     }
 }

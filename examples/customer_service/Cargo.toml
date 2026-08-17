@@ -10,8 +10,8 @@ description = "Next-gen multimodal customer-service voice agent (OpenAI or Gemin
 [dependencies]
 # ADK crates
 adk-realtime = { path = "../../adk-realtime", features = ["openai", "gemini", "integration"] }
-adk-core = { path = "../../adk-core" }
-adk-session = { path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }

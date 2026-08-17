@@ -1,5 +1,5 @@
 [package]
-name = "adk-telemetry"
+name = "agentx-adk-telemetry"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

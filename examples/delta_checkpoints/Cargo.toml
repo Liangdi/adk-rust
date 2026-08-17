@@ -8,10 +8,10 @@ publish = false
 
 [dependencies]
 # ADK crates (path deps to workspace)
-adk-core = { path = "../../adk-core" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 adk-graph = { path = "../../adk-graph", features = ["delta-checkpoint"] }
-adk-agent = { path = "../../adk-agent" }
-adk-model = { path = "../../adk-model", features = ["gemini"] }
+adk-agent = { package = "agentx-adk-agent", path = "../../adk-agent" }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["gemini"] }
 
 # Common dependencies
 tokio = { version = "1.40", features = ["full"] }

@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-adk-acp = { path = "../../adk-acp" }
+adk-acp = { package = "agentx-adk-acp", path = "../../adk-acp" }
 anyhow = "1.0"
 async-trait = "0.1"
 dotenvy = "0.15"

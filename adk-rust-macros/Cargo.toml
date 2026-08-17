@@ -1,5 +1,5 @@
 [package]
-name = "adk-rust-macros"
+name = "agentx-adk-rust-macros"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,7 +23,7 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 [dev-dependencies]
 # Internal dev-deps are path-only (no version) so cargo strips them from the
 # published manifest — they can never block or reorder a crates.io publish.
-adk-core = { path = "../adk-core" }
+adk-core = { package = "agentx-adk-core", path = "../adk-core" }
 async-trait.workspace = true
 schemars = "1.0"
 serde = { workspace = true }

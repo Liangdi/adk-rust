@@ -1,4 +1,7 @@
-use crate::discovery::{discover_instruction_files, discover_instruction_files_with_extras};
+use crate::discovery::{
+    discover_instruction_files, discover_instruction_files_with_extras,
+    discover_skill_files_with_extras,
+};
 use crate::error::SkillResult;
 use crate::model::{SkillDocument, SkillIndex};
 use crate::parser::parse_instruction_markdown;
@@ -7,20 +10,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// Loads a [`SkillIndex`] by discovering and parsing all instruction files under `root`.
-///
-/// Each file is read, parsed, and assigned a content-hash-based identifier.
-/// The resulting index is sorted by skill name and path.
-pub fn load_skill_index(root: impl AsRef<Path>) -> SkillResult<SkillIndex> {
+/// Reads, parses, and fingerprints each discovered file into a
+/// [`SkillDocument`]. Files that cannot be read or lack valid
+/// skill/instruction format are silently skipped — this allows non-skill .md
+/// files (reference docs, READMEs, etc.) to coexist under `.skills/` without
+/// causing parse errors.
+fn collect_skill_documents(paths: Vec<PathBuf>) -> Vec<SkillDocument> {
     let mut skills = Vec::new();
-    for path in discover_instruction_files(root)? {
+    for path in paths {
         let content = match fs::read_to_string(&path) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        // Skip files that don't have valid skill/instruction format.
-        // This allows non-skill .md files (reference docs, READMEs, etc.)
-        // to coexist under .skills/ without causing parse errors.
         let parsed = match parse_instruction_markdown(&path, &content) {
             Ok(p) => p,
             Err(_) => continue,
@@ -62,7 +63,15 @@ pub fn load_skill_index(root: impl AsRef<Path>) -> SkillResult<SkillIndex> {
             triggers: parsed.triggers,
         });
     }
+    skills
+}
 
+/// Loads a [`SkillIndex`] by discovering and parsing all instruction files under `root`.
+///
+/// Each file is read, parsed, and assigned a content-hash-based identifier.
+/// The resulting index is sorted by skill name and path.
+pub fn load_skill_index(root: impl AsRef<Path>) -> SkillResult<SkillIndex> {
+    let mut skills = collect_skill_documents(discover_instruction_files(root)?);
     skills.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     Ok(SkillIndex::new(skills))
 }
@@ -81,54 +90,30 @@ pub fn load_skill_index_with_extras(
     root: impl AsRef<Path>,
     extra_dirs: &[PathBuf],
 ) -> SkillResult<SkillIndex> {
+    load_skill_index_scoped(root, extra_dirs, true)
+}
+
+/// Loads a [`SkillIndex`] like [`load_skill_index_with_extras`], but can skip
+/// convention-file (AGENTS.md/CLAUDE.md/...) discovery.
+///
+/// Convention discovery walks the *entire* tree under `root`, which is
+/// prohibitively expensive for huge roots — a home directory spans millions of
+/// files across caches and package registries. With
+/// `include_convention_files: false` only the whitelisted skill directories
+/// (`.skills/`, `.claude/skills/`, `.agents/skills/`) plus `extra_dirs` are
+/// indexed.
+pub fn load_skill_index_scoped(
+    root: impl AsRef<Path>,
+    extra_dirs: &[PathBuf],
+    include_convention_files: bool,
+) -> SkillResult<SkillIndex> {
     let root = root.as_ref();
-    let mut skills = Vec::new();
-    for path in discover_instruction_files_with_extras(root, extra_dirs)? {
-        let content = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let parsed = match parse_instruction_markdown(&path, &content) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
-
-        let last_modified = fs::metadata(&path)
-            .ok()
-            .and_then(|meta| meta.modified().ok())
-            .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64);
-
-        let id = format!(
-            "{}-{}",
-            normalize_id(&parsed.name),
-            &hash.chars().take(12).collect::<String>()
-        );
-
-        skills.push(SkillDocument {
-            id,
-            name: parsed.name,
-            description: parsed.description,
-            version: parsed.version,
-            license: parsed.license,
-            compatibility: parsed.compatibility,
-            tags: parsed.tags,
-            allowed_tools: parsed.allowed_tools,
-            references: parsed.references,
-            trigger: parsed.trigger,
-            hint: parsed.hint,
-            metadata: parsed.metadata,
-            body: parsed.body,
-            path,
-            hash,
-            last_modified,
-            triggers: parsed.triggers,
-        });
-    }
+    let paths = if include_convention_files {
+        discover_instruction_files_with_extras(root, extra_dirs)?
+    } else {
+        discover_skill_files_with_extras(root, extra_dirs)?
+    };
+    let skills = collect_skill_documents(paths);
 
     // Deduplicate by name, preferring project-local skills (.skills/, .claude/skills/)
     // over global/extra paths. We build a map keyed by name; project-local entries
@@ -215,6 +200,26 @@ mod tests {
         assert_eq!(skill.name, "agents");
         assert!(skill.tags.iter().any(|t| t == "agents-md"));
         assert!(skill.body.contains("Use cargo test before commit."));
+    }
+
+    #[test]
+    fn scoped_load_without_convention_skips_convention_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir_all(root.join(".skills")).unwrap();
+        fs::write(root.join("AGENTS.md"), "# Repo Instructions\n").unwrap();
+        fs::write(
+            root.join(".skills/search.md"),
+            "---\nname: search\ndescription: Search docs\n---\nUse rg first.",
+        )
+        .unwrap();
+
+        let full = load_skill_index(root).unwrap();
+        assert_eq!(full.len(), 2);
+
+        let scoped = load_skill_index_scoped(root, &[], false).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped.skills()[0].name, "search");
     }
 
     #[test]

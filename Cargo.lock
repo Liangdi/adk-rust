@@ -56,78 +56,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-acp"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "adk-runner",
- "adk-session",
- "adk-tool",
- "agent-client-protocol",
- "agent-client-protocol-http",
- "async-stream",
- "async-trait",
- "axum 0.8.9",
- "base64 0.22.1",
- "futures",
- "proptest",
- "rmcp",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid 1.23.2",
-]
-
-[[package]]
 name = "adk-action"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "proptest",
  "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "adk-agent"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "adk-devtools",
- "adk-guardrail",
- "adk-model",
- "adk-plugin",
- "adk-runner",
- "adk-sandbox",
- "adk-session",
- "adk-skill",
- "adk-telemetry",
- "adk-tool",
- "anyhow",
- "async-stream",
- "async-trait",
- "axum 0.8.9",
- "chrono",
- "cron",
- "dotenvy",
- "futures",
- "jsonschema",
- "notify",
- "proptest",
- "reqwest 0.12.28",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]
@@ -152,27 +89,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-artifact"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "async-trait",
- "axum 0.8.9",
- "google-cloud-auth 1.12.0",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "adk-audio"
 version = "2.0.0"
 dependencies = [
- "adk-core",
  "adk-realtime",
+ "agentx-adk-core",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -207,8 +128,8 @@ dependencies = [
 name = "adk-auth"
 version = "2.0.0"
 dependencies = [
- "adk-core",
  "adk-server",
+ "agentx-adk-core",
  "async-trait",
  "aws-config",
  "aws-sdk-secretsmanager",
@@ -242,7 +163,7 @@ dependencies = [
 name = "adk-awp"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "arc-swap",
  "async-trait",
  "awp-types",
@@ -270,13 +191,13 @@ dependencies = [
 name = "adk-bench"
 version = "2.0.0"
 dependencies = [
- "adk-agent",
- "adk-core",
  "adk-eval",
- "adk-model",
- "adk-runner",
- "adk-session",
- "adk-tool",
+ "agentx-adk-agent",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-tool",
  "async-trait",
  "chrono",
  "futures",
@@ -294,7 +215,7 @@ dependencies = [
 name = "adk-browser"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "async-trait",
  "base64 0.22.1",
  "serde",
@@ -310,19 +231,19 @@ dependencies = [
 name = "adk-cli"
 version = "2.0.0"
 dependencies = [
- "adk-agent",
- "adk-artifact",
- "adk-core",
  "adk-deploy",
  "adk-devtools",
  "adk-graph",
- "adk-model",
- "adk-runner",
  "adk-server",
- "adk-session",
- "adk-skill",
- "adk-telemetry",
- "adk-tool",
+ "agentx-adk-agent",
+ "agentx-adk-artifact",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-skill",
+ "agentx-adk-telemetry",
+ "agentx-adk-tool",
  "anyhow",
  "async-trait",
  "axum 0.8.9",
@@ -344,8 +265,8 @@ dependencies = [
 name = "adk-code"
 version = "2.0.0"
 dependencies = [
- "adk-core",
  "adk-sandbox",
+ "agentx-adk-core",
  "async-trait",
  "boa_engine",
  "bollard",
@@ -368,9 +289,9 @@ dependencies = [
 name = "adk-codeact-monty"
 version = "2.0.0"
 dependencies = [
- "adk-agent",
  "adk-code",
- "adk-core",
+ "agentx-adk-agent",
+ "agentx-adk-core",
  "async-trait",
  "serde_json",
  "tempfile",
@@ -380,15 +301,15 @@ dependencies = [
 name = "adk-computer-use"
 version = "2.0.0"
 dependencies = [
- "adk-agent",
  "adk-auth",
- "adk-core",
  "adk-eval",
  "adk-graph",
- "adk-model",
- "adk-runner",
- "adk-session",
- "adk-tool",
+ "agentx-adk-agent",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-tool",
  "async-trait",
  "chrono",
  "futures",
@@ -397,24 +318,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid 1.23.2",
-]
-
-[[package]]
-name = "adk-core"
-version = "2.0.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "chrono",
- "futures",
- "proptest",
- "rustls 0.23.40",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -447,7 +350,7 @@ dependencies = [
 name = "adk-devtools"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "async-trait",
  "glob",
  "libc",
@@ -485,11 +388,11 @@ dependencies = [
 name = "adk-eval"
 version = "2.0.0"
 dependencies = [
- "adk-core",
  "adk-memory",
- "adk-model",
- "adk-runner",
- "adk-session",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-runner",
+ "agentx-adk-session",
  "async-trait",
  "chrono",
  "futures",
@@ -507,46 +410,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-gemini"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "async-stream",
- "async-trait",
- "base64 0.22.1",
- "display-error-chain",
- "eventsource-stream",
- "futures",
- "futures-util",
- "google-cloud-aiplatform-v1",
- "google-cloud-auth 1.12.0",
- "google-cloud-gax 1.11.0",
- "mime",
- "mime_guess",
- "proptest",
- "reqwest 0.12.28",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "snafu 0.8.9",
- "strum 0.28.0",
- "strum_macros 0.28.0",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "wiremock",
-]
-
-[[package]]
 name = "adk-graph"
 version = "2.0.0"
 dependencies = [
  "adk-action",
- "adk-agent",
- "adk-core",
- "adk-tool",
+ "agentx-adk-agent",
+ "agentx-adk-core",
+ "agentx-adk-tool",
  "async-stream",
  "async-trait",
  "blake3",
@@ -572,7 +442,7 @@ dependencies = [
 name = "adk-guardrail"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "async-trait",
  "futures",
  "jsonschema",
@@ -588,16 +458,16 @@ dependencies = [
 name = "adk-managed"
 version = "2.0.0"
 dependencies = [
- "adk-agent",
- "adk-core",
  "adk-memory",
- "adk-model",
- "adk-runner",
  "adk-sandbox",
- "adk-session",
- "adk-skill",
- "adk-telemetry",
- "adk-tool",
+ "agentx-adk-agent",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-skill",
+ "agentx-adk-telemetry",
+ "agentx-adk-tool",
  "async-stream",
  "async-trait",
  "chrono",
@@ -617,7 +487,7 @@ dependencies = [
 name = "adk-memory"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "async-trait",
  "chrono",
  "fred",
@@ -636,8 +506,8 @@ dependencies = [
 name = "adk-mistralrs"
 version = "2.0.0"
 dependencies = [
- "adk-core",
- "adk-telemetry",
+ "agentx-adk-core",
+ "agentx-adk-telemetry",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -659,47 +529,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-model"
-version = "2.0.0"
-dependencies = [
- "adk-anthropic",
- "adk-core",
- "adk-gemini",
- "adk-telemetry",
- "anyhow",
- "async-openai",
- "async-stream",
- "async-trait",
- "aws-config",
- "aws-sdk-bedrockruntime",
- "aws-smithy-types",
- "base64 0.22.1",
- "chrono",
- "dotenvy",
- "futures",
- "ollama-rs",
- "proptest",
- "reqwest 0.12.28",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.28.0",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
 name = "adk-payments"
 version = "2.0.0"
 dependencies = [
- "adk-artifact",
  "adk-auth",
- "adk-core",
  "adk-guardrail",
  "adk-memory",
- "adk-session",
+ "agentx-adk-artifact",
+ "agentx-adk-core",
+ "agentx-adk-session",
  "async-trait",
  "axum 0.8.9",
  "chrono",
@@ -720,21 +558,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-plugin"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "adk-rag"
 version = "2.0.0"
 dependencies = [
- "adk-core",
- "adk-gemini",
+ "agentx-adk-core",
+ "agentx-adk-gemini",
  "async-trait",
  "futures",
  "lancedb",
@@ -756,11 +584,11 @@ dependencies = [
 name = "adk-realtime"
 version = "2.0.0"
 dependencies = [
- "adk-core",
- "adk-gemini",
  "adk-memory",
- "adk-plugin",
- "adk-session",
+ "agentx-adk-core",
+ "agentx-adk-gemini",
+ "agentx-adk-plugin",
+ "agentx-adk-session",
  "anyhow",
  "async-openai",
  "async-stream",
@@ -802,107 +630,21 @@ dependencies = [
 name = "adk-retry-reflect"
 version = "2.0.0"
 dependencies = [
- "adk-core",
- "adk-plugin",
+ "agentx-adk-core",
+ "agentx-adk-plugin",
  "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "adk-runner"
-version = "2.0.0"
-dependencies = [
- "adk-artifact",
- "adk-core",
- "adk-plugin",
- "adk-sandbox",
- "adk-session",
- "adk-skill",
- "async-stream",
- "async-trait",
- "chrono",
- "futures",
- "proptest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tokio-util",
- "tracing",
- "uuid 1.23.2",
-]
-
-[[package]]
-name = "adk-rust"
-version = "2.0.0"
-dependencies = [
- "adk-acp",
- "adk-action",
- "adk-agent",
- "adk-anthropic",
- "adk-artifact",
- "adk-audio",
- "adk-auth",
- "adk-awp",
- "adk-browser",
- "adk-cli",
- "adk-code",
- "adk-codeact-monty",
- "adk-computer-use",
- "adk-core",
- "adk-enterprise",
- "adk-eval",
- "adk-graph",
- "adk-guardrail",
- "adk-managed",
- "adk-memory",
- "adk-model",
- "adk-payments",
- "adk-plugin",
- "adk-rag",
- "adk-realtime",
- "adk-runner",
- "adk-sandbox",
- "adk-server",
- "adk-session",
- "adk-skill",
- "adk-telemetry",
- "adk-tool",
- "anyhow",
- "async-trait",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "adk-rust-macros"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "async-trait",
- "proc-macro2",
- "quote",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "syn 2.0.117",
- "tokio",
 ]
 
 [[package]]
 name = "adk-sandbox"
 version = "2.0.0"
 dependencies = [
- "adk-core",
+ "agentx-adk-core",
  "async-trait",
  "bollard",
  "find-msvc-tools",
@@ -927,14 +669,14 @@ name = "adk-server"
 version = "2.0.0"
 dependencies = [
  "a2a-protocol-types",
- "adk-agent",
- "adk-artifact",
- "adk-core",
  "adk-memory",
- "adk-runner",
- "adk-session",
- "adk-skill",
- "adk-telemetry",
+ "agentx-adk-agent",
+ "agentx-adk-artifact",
+ "agentx-adk-core",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-skill",
+ "agentx-adk-telemetry",
  "anyhow",
  "async-stream",
  "async-trait",
@@ -967,102 +709,6 @@ dependencies = [
  "tower-http 0.6.11",
  "tracing",
  "tracing-subscriber",
- "uuid 1.23.2",
-]
-
-[[package]]
-name = "adk-session"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "aes-gcm",
- "async-trait",
- "axum 0.8.9",
- "base64 0.22.1",
- "chrono",
- "firestore",
- "fred",
- "futures",
- "google-cloud-auth 1.12.0",
- "http 1.4.1",
- "mongodb",
- "neo4rs",
- "proptest",
- "rand 0.9.4",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx 0.9.0",
- "tokio",
- "tracing",
- "uuid 1.23.2",
-]
-
-[[package]]
-name = "adk-skill"
-version = "2.0.0"
-dependencies = [
- "adk-core",
- "adk-plugin",
- "async-trait",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "walkdir",
-]
-
-[[package]]
-name = "adk-telemetry"
-version = "2.0.0"
-dependencies = [
- "google-cloud-auth 1.12.0",
- "http 1.4.1",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "proptest",
- "rusqlite",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tonic 0.14.6",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "adk-tool"
-version = "2.0.0"
-dependencies = [
- "adk-code",
- "adk-core",
- "adk-memory",
- "adk-rust-macros",
- "adk-sandbox",
- "adk-telemetry",
- "async-stream",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "futures",
- "gcp-bigquery-client",
- "google-cloud-spanner",
- "proptest",
- "reqwest 0.12.28",
- "reqwest 0.13.4",
- "rmcp",
- "schemars 1.2.1",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
  "uuid 1.23.2",
 ]
 
@@ -1189,6 +835,360 @@ dependencies = [
  "serde_with",
  "strum 0.28.0",
  "tracing",
+]
+
+[[package]]
+name = "agentx-adk-acp"
+version = "2.0.0"
+dependencies = [
+ "agent-client-protocol",
+ "agent-client-protocol-http",
+ "agentx-adk-core",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-tool",
+ "async-stream",
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "futures",
+ "proptest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid 1.23.2",
+]
+
+[[package]]
+name = "agentx-adk-agent"
+version = "2.0.0"
+dependencies = [
+ "adk-devtools",
+ "adk-guardrail",
+ "adk-sandbox",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-plugin",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-skill",
+ "agentx-adk-telemetry",
+ "agentx-adk-tool",
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum 0.8.9",
+ "chrono",
+ "cron",
+ "dotenvy",
+ "futures",
+ "jsonschema",
+ "notify",
+ "proptest",
+ "reqwest 0.12.28",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "agentx-adk-artifact"
+version = "2.0.0"
+dependencies = [
+ "agentx-adk-core",
+ "async-trait",
+ "axum 0.8.9",
+ "google-cloud-auth 1.12.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentx-adk-core"
+version = "2.0.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "proptest",
+ "rustls 0.23.40",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid 1.23.2",
+]
+
+[[package]]
+name = "agentx-adk-gemini"
+version = "2.0.0"
+dependencies = [
+ "agentx-adk-core",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "display-error-chain",
+ "eventsource-stream",
+ "futures",
+ "futures-util",
+ "google-cloud-aiplatform-v1",
+ "google-cloud-auth 1.12.0",
+ "google-cloud-gax 1.11.0",
+ "mime",
+ "mime_guess",
+ "proptest",
+ "reqwest 0.12.28",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "snafu 0.8.9",
+ "strum 0.28.0",
+ "strum_macros 0.28.0",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "agentx-adk-model"
+version = "2.0.0"
+dependencies = [
+ "adk-anthropic",
+ "agentx-adk-core",
+ "agentx-adk-gemini",
+ "agentx-adk-telemetry",
+ "anyhow",
+ "async-openai",
+ "async-stream",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-bedrockruntime",
+ "aws-smithy-types",
+ "base64 0.22.1",
+ "chrono",
+ "dotenvy",
+ "futures",
+ "ollama-rs",
+ "proptest",
+ "reqwest 0.12.28",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
+name = "agentx-adk-plugin"
+version = "2.0.0"
+dependencies = [
+ "agentx-adk-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentx-adk-runner"
+version = "2.0.0"
+dependencies = [
+ "adk-sandbox",
+ "agentx-adk-artifact",
+ "agentx-adk-core",
+ "agentx-adk-plugin",
+ "agentx-adk-session",
+ "agentx-adk-skill",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "futures",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
+ "tracing",
+ "uuid 1.23.2",
+]
+
+[[package]]
+name = "agentx-adk-rust"
+version = "2.0.0"
+dependencies = [
+ "adk-action",
+ "adk-anthropic",
+ "adk-audio",
+ "adk-auth",
+ "adk-awp",
+ "adk-browser",
+ "adk-cli",
+ "adk-code",
+ "adk-codeact-monty",
+ "adk-computer-use",
+ "adk-enterprise",
+ "adk-eval",
+ "adk-graph",
+ "adk-guardrail",
+ "adk-managed",
+ "adk-memory",
+ "adk-payments",
+ "adk-rag",
+ "adk-realtime",
+ "adk-sandbox",
+ "adk-server",
+ "agentx-adk-acp",
+ "agentx-adk-agent",
+ "agentx-adk-artifact",
+ "agentx-adk-core",
+ "agentx-adk-model",
+ "agentx-adk-plugin",
+ "agentx-adk-runner",
+ "agentx-adk-session",
+ "agentx-adk-skill",
+ "agentx-adk-telemetry",
+ "agentx-adk-tool",
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentx-adk-rust-macros"
+version = "2.0.0"
+dependencies = [
+ "agentx-adk-core",
+ "async-trait",
+ "proc-macro2",
+ "quote",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "tokio",
+]
+
+[[package]]
+name = "agentx-adk-session"
+version = "2.0.0"
+dependencies = [
+ "aes-gcm",
+ "agentx-adk-core",
+ "async-trait",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "chrono",
+ "firestore",
+ "fred",
+ "futures",
+ "google-cloud-auth 1.12.0",
+ "http 1.4.1",
+ "mongodb",
+ "neo4rs",
+ "proptest",
+ "rand 0.9.4",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx 0.9.0",
+ "tokio",
+ "tracing",
+ "uuid 1.23.2",
+]
+
+[[package]]
+name = "agentx-adk-skill"
+version = "2.0.0"
+dependencies = [
+ "agentx-adk-core",
+ "agentx-adk-plugin",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "walkdir",
+]
+
+[[package]]
+name = "agentx-adk-telemetry"
+version = "2.0.0"
+dependencies = [
+ "google-cloud-auth 1.12.0",
+ "http 1.4.1",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "proptest",
+ "rusqlite",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.14.6",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "agentx-adk-tool"
+version = "2.0.0"
+dependencies = [
+ "adk-code",
+ "adk-memory",
+ "adk-sandbox",
+ "agentx-adk-core",
+ "agentx-adk-rust-macros",
+ "agentx-adk-telemetry",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "futures",
+ "gcp-bigquery-client",
+ "google-cloud-spanner",
+ "proptest",
+ "reqwest 0.12.28",
+ "reqwest 0.13.4",
+ "rmcp",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid 1.23.2",
 ]
 
 [[package]]

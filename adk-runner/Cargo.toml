@@ -1,5 +1,5 @@
 [package]
-name = "adk-runner"
+name = "agentx-adk-runner"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

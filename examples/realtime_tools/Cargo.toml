@@ -10,8 +10,8 @@ description = "Demonstrates tool calling in realtime voice sessions using Integr
 [dependencies]
 # ADK crates
 adk-realtime = { path = "../../adk-realtime", features = ["openai", "integration"] }
-adk-core = { path = "../../adk-core" }
-adk-session = { path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
 adk-memory = { path = "../../adk-memory" }
 
 # Async runtime

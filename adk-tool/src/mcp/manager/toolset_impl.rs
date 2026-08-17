@@ -85,12 +85,16 @@ impl Tool for PrefixedTool {
     }
 }
 
-/// Resolve tool name collisions across multiple servers.
+/// Resolve tool name collisions across multiple servers, keeping server grouping.
 ///
 /// For tool names that appear in two or more servers, the tool is wrapped in a
 /// [`PrefixedTool`] with the format `{server_id}__{tool_name}`. Tools with
-/// unique names across all servers retain their original names.
-fn resolve_tool_names(server_tools: &ServerToolMap) -> Vec<Arc<dyn Tool>> {
+/// unique names across all servers retain their original names. The returned
+/// map is keyed by server id; each entry is `(resolved_name, tool)` so callers
+/// can attribute tools to their server without re-deriving the prefix rule.
+fn resolve_tool_names_grouped(
+    server_tools: &ServerToolMap,
+) -> HashMap<String, Vec<(String, Arc<dyn Tool>)>> {
     // Step 1: Count occurrences of each tool name across all servers
     let mut name_counts: HashMap<&str, Vec<&str>> = HashMap::new();
     for (server_id, tools) in server_tools {
@@ -100,31 +104,50 @@ fn resolve_tool_names(server_tools: &ServerToolMap) -> Vec<Arc<dyn Tool>> {
     }
 
     // Step 2: For names appearing in multiple servers, prefix with server_id
-    let mut result = Vec::new();
+    let mut resolved: HashMap<String, Vec<(String, Arc<dyn Tool>)>> = HashMap::new();
     for (server_id, tools) in server_tools {
+        let mut named: Vec<(String, Arc<dyn Tool>)> = Vec::with_capacity(tools.len());
         for (name, tool) in tools {
-            if name_counts[name.as_str()].len() > 1 {
-                result.push(Arc::new(PrefixedTool {
-                    inner: tool.clone(),
-                    prefixed_name: format!("{server_id}__{name}"),
-                }) as Arc<dyn Tool>);
+            let collides = name_counts[name.as_str()].len() > 1;
+            let resolved_name = if collides {
+                format!("{server_id}__{name}")
             } else {
-                result.push(tool.clone());
-            }
+                name.clone()
+            };
+            let tool: Arc<dyn Tool> = if collides {
+                Arc::new(PrefixedTool { inner: tool.clone(), prefixed_name: resolved_name.clone() })
+            } else {
+                tool.clone()
+            };
+            named.push((resolved_name, tool));
         }
+        resolved.insert(server_id.clone(), named);
     }
-    result
+    resolved
 }
 
-#[async_trait]
-impl Toolset for McpServerManager {
-    fn name(&self) -> &str {
-        &self.name
-    }
+/// Resolve tool name collisions across multiple servers, flattened.
+///
+/// For tool names that appear in two or more servers, the tool is wrapped in a
+/// [`PrefixedTool`] with the format `{server_id}__{tool_name}`. Tools with
+/// unique names across all servers retain their original names.
+fn resolve_tool_names(server_tools: &ServerToolMap) -> Vec<Arc<dyn Tool>> {
+    let grouped = resolve_tool_names_grouped(server_tools);
+    // Walk the same outer iteration order as the grouped pass so the flat
+    // output sequence is unchanged by the refactor.
+    server_tools
+        .keys()
+        .filter_map(|id| grouped.get(id))
+        .flat_map(|v| v.iter().map(|(_, t)| t.clone()))
+        .collect()
+}
 
-    async fn tools(&self, ctx: Arc<dyn ReadonlyContext>) -> Result<Vec<Arc<dyn Tool>>> {
-        // Snapshot running toolsets so slow network discovery does not hold the
-        // manager map lock and block lifecycle changes.
+impl McpServerManager {
+    /// Snapshot running toolsets and list each one's tools into a per-server
+    /// map. Snapshotting under the read lock ensures slow network discovery
+    /// does not hold the manager map lock and block lifecycle changes.
+    /// Servers that fail to list are skipped with a warn (existing behavior).
+    async fn snapshot_server_tools(&self, ctx: Arc<dyn ReadonlyContext>) -> ServerToolMap {
         let running = {
             let servers = self.servers.read().await;
             servers
@@ -154,8 +177,34 @@ impl Toolset for McpServerManager {
                 }
             }
         }
+        server_tools
+    }
 
-        Ok(resolve_tool_names(&server_tools))
+    /// Like [`Toolset::tools`](adk_core::Toolset::tools), but grouped per
+    /// server id. Each server's tools carry the same resolved names the flat
+    /// list uses (colliding names prefixed `{server_id}__{name}`), so callers
+    /// can both attach the flat list to an agent and attribute tools to their
+    /// owning server.
+    pub async fn tools_by_server(
+        &self,
+        ctx: Arc<dyn ReadonlyContext>,
+    ) -> Result<HashMap<String, Vec<Arc<dyn Tool>>>> {
+        let resolved = resolve_tool_names_grouped(&self.snapshot_server_tools(ctx).await);
+        Ok(resolved
+            .into_iter()
+            .map(|(id, v)| (id, v.into_iter().map(|(_, t)| t).collect()))
+            .collect())
+    }
+}
+
+#[async_trait]
+impl Toolset for McpServerManager {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn tools(&self, ctx: Arc<dyn ReadonlyContext>) -> Result<Vec<Arc<dyn Tool>>> {
+        Ok(resolve_tool_names(&self.snapshot_server_tools(ctx).await))
     }
 }
 
@@ -297,5 +346,56 @@ mod tests {
         let mut names: Vec<String> = result.iter().map(|t| t.name().to_string()).collect();
         names.sort();
         assert_eq!(names, vec!["a__shared", "b__shared", "c__shared"]);
+    }
+
+    #[test]
+    fn test_resolve_grouped_attributes_tools_per_server() {
+        let mut server_tools: ServerToolMap = HashMap::new();
+        server_tools.insert(
+            "server_a".to_string(),
+            vec![
+                ("read_file".to_string(), make_tool("read_file")),
+                ("unique_a".to_string(), make_tool("unique_a")),
+            ],
+        );
+        server_tools.insert(
+            "server_b".to_string(),
+            vec![
+                ("read_file".to_string(), make_tool("read_file")),
+                ("unique_b".to_string(), make_tool("unique_b")),
+            ],
+        );
+
+        let grouped = resolve_tool_names_grouped(&server_tools);
+        assert_eq!(grouped.len(), 2);
+
+        // Collisions are prefixed within each server; unique names stay bare.
+        let mut a: Vec<String> =
+            grouped["server_a"].iter().map(|(name, _)| name.clone()).collect();
+        a.sort();
+        assert_eq!(a, vec!["server_a__read_file", "unique_a"]);
+        let mut b: Vec<String> =
+            grouped["server_b"].iter().map(|(name, _)| name.clone()).collect();
+        b.sort();
+        assert_eq!(b, vec!["server_b__read_file", "unique_b"]);
+
+        // The wrapped tools report the resolved names too.
+        let a_tool = grouped["server_a"].iter().find(|(n, _)| n == "server_a__read_file").unwrap();
+        assert_eq!(a_tool.1.name(), "server_a__read_file");
+
+        // Flattening the grouped map matches the flat resolver's name set.
+        let flat: Vec<String> = resolve_tool_names(&server_tools)
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        let mut from_grouped: Vec<String> = grouped
+            .values()
+            .flatten()
+            .map(|(name, _)| name.clone())
+            .collect();
+        from_grouped.sort();
+        let mut flat_sorted = flat.clone();
+        flat_sorted.sort();
+        assert_eq!(from_grouped, flat_sorted);
     }
 }

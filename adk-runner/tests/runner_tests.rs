@@ -614,8 +614,33 @@ async fn test_runner_with_auto_skills_mutates_user_prompt() {
         .await
         .unwrap();
 
-    let first = stream.next().await.unwrap().unwrap();
-    let text = first
+    // The skill injection emits a stream-only skill/selected event BEFORE the
+    // agent's own events: author == "skill", the name rides in the content,
+    // the id in provider_metadata. The agent echo (which carries the injected
+    // block) follows.
+    let skill_ev = stream.next().await.unwrap().unwrap();
+    assert_eq!(skill_ev.author, adk_core::SKILL_AUTHOR, "first event is the skill marker");
+    assert_eq!(skill_ev.step, 1);
+    let skill_text = skill_ev
+        .llm_response
+        .content
+        .as_ref()
+        .unwrap()
+        .parts
+        .iter()
+        .find_map(|p| p.text())
+        .unwrap()
+        .to_string();
+    assert_eq!(skill_text, "search", "skill name travels in the event content");
+    let meta = skill_ev.llm_response.provider_metadata.as_ref().unwrap();
+    let skill_id = meta[adk_core::SKILL_ID_METADATA_KEY].as_str().unwrap();
+    assert!(
+        skill_id.starts_with("search-"),
+        "skill id (name-hash) travels in provider_metadata: {skill_id}"
+    );
+
+    let echo = stream.next().await.unwrap().unwrap();
+    let text = echo
         .llm_response
         .content
         .unwrap()

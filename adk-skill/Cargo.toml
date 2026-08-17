@@ -1,5 +1,5 @@
 [package]
-name = "adk-skill"
+name = "agentx-adk-skill"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

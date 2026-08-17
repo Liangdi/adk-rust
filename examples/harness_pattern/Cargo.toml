@@ -8,8 +8,8 @@ description = "Demonstrates the Harness trait pattern: Runner (production with r
 [workspace]
 
 [dependencies]
-adk-core = { path = "../../adk-core" }
-adk-model = { path = "../../adk-model", features = ["gemini"] }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["gemini"] }
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 thiserror = "2.0"

@@ -6,8 +6,8 @@ publish = false
 
 # Enterprise tier — standard + realtime, browser, RAG, payments, AWP.
 [dependencies]
-adk-rust = { path = "../../../adk-rust", features = ["enterprise"] }
-adk-tool = { path = "../../../adk-tool" }
+adk-rust = { package = "agentx-adk-rust", path = "../../../adk-rust", features = ["enterprise"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../../adk-tool" }
 tokio = { version = "1.40", features = ["full"] }
 anyhow = "1.0"
 dotenvy = "0.15"

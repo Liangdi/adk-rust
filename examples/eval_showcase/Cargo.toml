@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 adk-eval = { path = "../../adk-eval", features = ["embedding", "ci-helpers", "statistics"] }
-adk-core = { path = "../../adk-core" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 adk-memory = { path = "../../adk-memory", features = ["embedding-trait"] }
 async-trait = "0.1"
 chrono = "0.4"

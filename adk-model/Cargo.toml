@@ -1,5 +1,5 @@
 [package]
-name = "adk-model"
+name = "agentx-adk-model"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

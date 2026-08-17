@@ -7,8 +7,8 @@ publish = false
 # Standard tier — adds tools, memory, telemetry, server, auth, graph, eval, guardrail,
 # plugin, artifacts, and skills. CLI providers remain opt-in.
 [dependencies]
-adk-rust = { path = "../../../adk-rust", features = ["standard"] }
-adk-tool = { path = "../../../adk-tool" }
+adk-rust = { package = "agentx-adk-rust", path = "../../../adk-rust", features = ["standard"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../../adk-tool" }
 tokio = { version = "1.40", features = ["full"] }
 anyhow = "1.0"
 dotenvy = "0.15"

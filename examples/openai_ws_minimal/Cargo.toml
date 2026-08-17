@@ -7,9 +7,9 @@ publish = false
 [workspace]
 
 [dependencies]
-adk-rust = { path = "../../adk-rust", features = ["openai"] }
-adk-model = { path = "../../adk-model", features = ["openai-ws"] }
-adk-tool = { path = "../../adk-tool" }
+adk-rust = { package = "agentx-adk-rust", path = "../../adk-rust", features = ["openai"] }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["openai-ws"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool" }
 async-openai = { version = "0.41", default-features = false, features = ["rustls", "responses"] }
 tokio = { version = "1.40", features = ["full"] }
 futures = "0.3"

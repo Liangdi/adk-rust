@@ -8,11 +8,11 @@ publish = false
 
 [dependencies]
 adk-awp = { path = "../../adk-awp" }
-adk-core = { path = "../../adk-core" }
-adk-agent = { path = "../../adk-agent" }
-adk-model = { path = "../../adk-model", features = ["gemini"] }
-adk-runner = { path = "../../adk-runner" }
-adk-session = { path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-agent = { package = "agentx-adk-agent", path = "../../adk-agent" }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["gemini"] }
+adk-runner = { package = "agentx-adk-runner", path = "../../adk-runner" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
 awp-types = { path = "../../awp-types" }
 axum = { version = "0.8", features = ["macros"] }
 arc-swap = "1"

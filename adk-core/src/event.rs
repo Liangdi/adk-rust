@@ -23,6 +23,16 @@ pub const TOOL_PROGRESS_STREAM_KEY: &str = "adk.tool_progress.stream";
 /// function-call id on a tool-progress event.
 pub const TOOL_PROGRESS_CALL_ID_KEY: &str = "adk.tool_progress.call_id";
 
+/// `Event.author` of the stream-only event the runner emits when a skill is
+/// injected into a turn's user message. The event is never persisted to the
+/// session (the injection block itself rides inside the user message), so
+/// consumers can safely treat it as presentation metadata.
+pub const SKILL_AUTHOR: &str = "skill";
+
+/// `Event.llm_response.provider_metadata` key carrying the selected skill's
+/// id on a [`SKILL_AUTHOR`] event.
+pub const SKILL_ID_METADATA_KEY: &str = "skill_id";
+
 /// Event represents a single interaction in a conversation.
 /// This struct embeds LlmResponse to match ADK-Go's design pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]

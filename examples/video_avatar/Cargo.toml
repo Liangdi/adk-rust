@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 # ADK crates (path deps to workspace)
 adk-realtime = { path = "../../adk-realtime", features = ["video-avatar"] }
-adk-core = { path = "../../adk-core" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 
 # Common dependencies
 tokio = { version = "1.40", features = ["full"] }

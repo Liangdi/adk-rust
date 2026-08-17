@@ -9,13 +9,13 @@ description = "An ordinary text LlmAgent with a bi-temporal knowledge-graph long
 
 [dependencies]
 # ADK crates (path deps to the workspace)
-adk-core = { path = "../../adk-core" }
-adk-agent = { path = "../../adk-agent" }
-adk-model = { path = "../../adk-model", features = ["gemini"] }
-adk-runner = { path = "../../adk-runner" }
-adk-session = { path = "../../adk-session" }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
+adk-agent = { package = "agentx-adk-agent", path = "../../adk-agent" }
+adk-model = { package = "agentx-adk-model", path = "../../adk-model", features = ["gemini"] }
+adk-runner = { package = "agentx-adk-runner", path = "../../adk-runner" }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session" }
 adk-memory = { path = "../../adk-memory", features = ["graph-memory"] }
-adk-tool = { path = "../../adk-tool", features = ["graph-memory-tools"] }
+adk-tool = { package = "agentx-adk-tool", path = "../../adk-tool", features = ["graph-memory-tools"] }
 
 # Runtime + helpers
 tokio = { version = "1.40", features = ["full"] }

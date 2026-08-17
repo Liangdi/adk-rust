@@ -7,8 +7,8 @@ publish = false
 [workspace]
 
 [dependencies]
-adk-rust = { path = "../../adk-rust", features = ["standard"] }
-adk-session = { path = "../../adk-session", features = ["encrypted-session"] }
-adk-core = { path = "../../adk-core" }
+adk-rust = { package = "agentx-adk-rust", path = "../../adk-rust", features = ["standard"] }
+adk-session = { package = "agentx-adk-session", path = "../../adk-session", features = ["encrypted-session"] }
+adk-core = { package = "agentx-adk-core", path = "../../adk-core" }
 tokio = { version = "1.40", features = ["full"] }
 serde_json = "1.0"

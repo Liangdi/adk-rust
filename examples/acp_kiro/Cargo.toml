@@ -7,8 +7,8 @@ publish = false
 [workspace]
 
 [dependencies]
-adk-rust = { path = "../../adk-rust" }
-adk-acp = { path = "../../adk-acp" }
+adk-rust = { package = "agentx-adk-rust", path = "../../adk-rust" }
+adk-acp = { package = "agentx-adk-acp", path = "../../adk-acp" }
 tokio = { version = "1.40", features = ["full"] }
 anyhow = "1.0"
 dotenvy = "0.15"
