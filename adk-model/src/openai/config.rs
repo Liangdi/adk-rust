@@ -39,6 +39,10 @@ pub struct OpenAIConfig {
     /// Only applicable to reasoning-capable models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Extra HTTP headers stamped on every request (gateway identity etc.),
+    /// as ordered `(name, value)` pairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl Default for OpenAIConfig {
@@ -50,6 +54,7 @@ impl Default for OpenAIConfig {
             project_id: None,
             base_url: None,
             reasoning_effort: None,
+            extra_headers: Vec::new(),
         }
     }
 }
@@ -89,6 +94,15 @@ impl OpenAIConfig {
     /// Set the reasoning effort for reasoning models (o1, o3, etc.).
     pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Set extra HTTP headers stamped on every request (gateway identity
+    /// etc.). Invalid names/values surface as an error at client
+    /// construction.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
         self
     }
 }

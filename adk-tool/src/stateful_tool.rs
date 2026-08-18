@@ -59,6 +59,7 @@ pub struct StatefulTool<S: Send + Sync + 'static> {
     long_running: bool,
     read_only: bool,
     concurrency_safe: bool,
+    parallel_safe: bool,
     parameters_schema: Option<Value>,
     response_schema: Option<Value>,
     scopes: Vec<&'static str>,
@@ -91,6 +92,7 @@ impl<S: Send + Sync + 'static> StatefulTool<S> {
             long_running: false,
             read_only: false,
             concurrency_safe: false,
+            parallel_safe: false,
             parameters_schema: None,
             response_schema: None,
             scopes: Vec::new(),
@@ -112,6 +114,22 @@ impl<S: Send + Sync + 'static> StatefulTool<S> {
     /// Mark this tool as concurrency-safe (can run in parallel with other tools).
     pub fn with_concurrency_safe(mut self, concurrency_safe: bool) -> Self {
         self.concurrency_safe = concurrency_safe;
+        self
+    }
+
+    /// Mark this tool as parallel-safe: it may run concurrently with itself
+    /// and its siblings even though it is not read-only, because its side
+    /// effects are isolated per call (delegation/spawn-style tools).
+    ///
+    /// This is the explicit opt-in tier for [`ToolExecutionStrategy::Auto`]:
+    /// a call joins the concurrent subset when this flag is set, without the
+    /// tool having to (falsely) claim `read_only`. The classic
+    /// read-only + concurrency-safe rule is unchanged for tools that do not
+    /// opt in.
+    ///
+    /// [`ToolExecutionStrategy::Auto`]: adk_core::ToolExecutionStrategy
+    pub fn with_parallel_safe(mut self, parallel_safe: bool) -> Self {
+        self.parallel_safe = parallel_safe;
         self
     }
 
@@ -188,6 +206,10 @@ impl<S: Send + Sync + 'static> Tool for StatefulTool<S> {
 
     fn is_concurrency_safe(&self) -> bool {
         self.concurrency_safe
+    }
+
+    fn is_parallel_safe(&self) -> bool {
+        self.parallel_safe
     }
 
     fn parameters_schema(&self) -> Option<Value> {

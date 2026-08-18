@@ -41,6 +41,9 @@ impl OpenAIClient {
         if let Some(effort) = reasoning_effort {
             compat_config = compat_config.with_reasoning_effort(effort);
         }
+        if !config.extra_headers.is_empty() {
+            compat_config = compat_config.with_extra_headers(config.extra_headers);
+        }
 
         Ok(Self { inner: OpenAICompatible::new(compat_config)? })
     }

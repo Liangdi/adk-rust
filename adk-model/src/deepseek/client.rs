@@ -46,6 +46,7 @@ use serde_json::Value;
 pub struct DeepSeekClient {
     client: Client,
     config: DeepSeekConfig,
+    extra_headers: reqwest::header::HeaderMap,
     retry_config: RetryConfig,
 }
 
@@ -55,8 +56,9 @@ impl DeepSeekClient {
         let client = Client::builder()
             .build()
             .map_err(|e| AdkError::model(format!("failed to create HTTP client: {e}")))?;
+        let extra_headers = crate::custom_headers::parse_extra_headers(&config.extra_headers)?;
 
-        Ok(Self { client, config, retry_config: RetryConfig::default() })
+        Ok(Self { client, config, extra_headers, retry_config: RetryConfig::default() })
     }
 
     /// Create a client for `deepseek-v4-pro` (strongest reasoning, thinking enabled).
@@ -215,6 +217,7 @@ impl Llm for DeepSeekClient {
         let usage_span = adk_telemetry::llm_generate_span("deepseek", &self.config.model, stream);
         let api_url = self.api_url();
         let api_key = self.config.api_key.clone();
+        let extra_headers = self.extra_headers.clone();
         let chat_request = self.build_request(&request, stream);
         // Debugging aid: point ADK_DUMP_REQUESTS at a directory to capture the
         // exact wire request (pretty JSON) for every DeepSeek call. Best-effort
@@ -249,12 +252,14 @@ impl Llm for DeepSeekClient {
                 let client = client.clone();
                 let api_url = api_url.clone();
                 let api_key = api_key.clone();
+                let extra_headers = extra_headers.clone();
                 let chat_request = chat_request.clone();
                 async move {
                     let response = client
                         .post(&api_url)
                         .header("Authorization", format!("Bearer {api_key}"))
                         .header("Content-Type", "application/json")
+                        .headers(extra_headers)
                         .json(&chat_request)
                         .send()
                         .await
@@ -994,5 +999,25 @@ mod reasoning_stream_tests {
             Some("need a tool"),
             "a thinking→tool-call turn keeps its reasoning trail"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_headers_parse_at_client_construction() {
+        let config = DeepSeekConfig::new("test-key", "deepseek-v4-flash")
+            .with_extra_headers(vec![("X-Agent-Id".to_string(), "agent-7".to_string())]);
+        let client = DeepSeekClient::new(config).expect("client creation failed");
+        assert_eq!(client.extra_headers.get("x-agent-id").unwrap(), "agent-7");
+    }
+
+    #[test]
+    fn invalid_extra_header_name_fails_construction() {
+        let config = DeepSeekConfig::new("test-key", "deepseek-v4-flash")
+            .with_extra_headers(vec![("Bad Name".to_string(), "v".to_string())]);
+        assert!(DeepSeekClient::new(config).is_err());
     }
 }

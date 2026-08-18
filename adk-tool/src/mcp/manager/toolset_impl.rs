@@ -64,6 +64,10 @@ impl Tool for PrefixedTool {
         self.inner.is_concurrency_safe()
     }
 
+    fn is_parallel_safe(&self) -> bool {
+        self.inner.is_parallel_safe()
+    }
+
     fn is_builtin(&self) -> bool {
         self.inner.is_builtin()
     }
@@ -321,6 +325,7 @@ mod tests {
         assert_eq!(prefixed.is_long_running(), inner.is_long_running());
         assert_eq!(prefixed.is_read_only(), inner.is_read_only());
         assert_eq!(prefixed.is_concurrency_safe(), inner.is_concurrency_safe());
+        assert_eq!(prefixed.is_parallel_safe(), inner.is_parallel_safe());
         assert_eq!(prefixed.is_builtin(), inner.is_builtin());
     }
 

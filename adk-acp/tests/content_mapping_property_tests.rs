@@ -5,7 +5,7 @@
 //! `block_to_part` followed by `part_to_block` preserves the MIME type and
 //! payload (URI preserved for embedded resources).
 
-use adk_acp::content::{block_to_part, part_to_block};
+use agentx_adk_acp::content::{block_to_part, part_to_block};
 use agent_client_protocol::schema::v1::{
     AudioContent, BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
     ImageContent, TextContent, TextResourceContents,

@@ -38,6 +38,10 @@ pub struct OpenAICompatibleConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Whether to allow the model to call multiple tools in a single turn.
     pub parallel_tool_calls: bool,
+    /// Extra HTTP headers stamped on every request (gateway identity etc.),
+    /// as ordered `(name, value)` pairs. Parsed once at client construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl OpenAICompatibleConfig {
@@ -52,6 +56,7 @@ impl OpenAICompatibleConfig {
             project_id: None,
             reasoning_effort: None,
             parallel_tool_calls: true,
+            extra_headers: Vec::new(),
         }
     }
 
@@ -76,6 +81,15 @@ impl OpenAICompatibleConfig {
     /// Set project ID.
     pub fn with_project(mut self, project_id: impl Into<String>) -> Self {
         self.project_id = Some(project_id.into());
+        self
+    }
+
+    /// Set extra HTTP headers stamped on every request (gateway identity
+    /// etc.). Invalid names/values surface as an error at client
+    /// construction.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
         self
     }
 
@@ -235,12 +249,14 @@ pub struct OpenAICompatible {
     reasoning_effort: Option<ReasoningEffort>,
     organization_id: Option<String>,
     parallel_tool_calls: bool,
+    extra_headers: reqwest::header::HeaderMap,
 }
 
 impl OpenAICompatible {
     /// Create a new OpenAI-compatible client.
     pub fn new(config: OpenAICompatibleConfig) -> Result<Self, AdkError> {
         let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let extra_headers = crate::custom_headers::parse_extra_headers(&config.extra_headers)?;
 
         Ok(Self {
             http: reqwest::Client::new(),
@@ -252,6 +268,7 @@ impl OpenAICompatible {
             reasoning_effort: config.reasoning_effort,
             organization_id: config.organization_id,
             parallel_tool_calls: config.parallel_tool_calls,
+            extra_headers,
         })
     }
 
@@ -361,6 +378,7 @@ async fn send_request(
     url: &str,
     api_key: &str,
     organization_id: &Option<String>,
+    extra_headers: &reqwest::header::HeaderMap,
     body: &serde_json::Value,
     provider_name: &str,
 ) -> Result<reqwest::Response, AdkError> {
@@ -369,6 +387,7 @@ async fn send_request(
     if let Some(org_id) = organization_id {
         http_req = http_req.header("OpenAI-Organization", org_id);
     }
+    http_req = http_req.headers(extra_headers.clone());
 
     let http_resp = http_req.send().await.map_err(|e| {
         AdkError::new(
@@ -519,6 +538,7 @@ impl Llm for OpenAICompatible {
         let retry_config = self.retry_config.clone();
         let reasoning_effort = self.reasoning_effort.clone();
         let organization_id = self.organization_id.clone();
+        let extra_headers = self.extra_headers.clone();
 
         // Normalize tool schemas at request time using the schema adapter.
         let adapter = self.schema_adapter();
@@ -557,10 +577,11 @@ impl Llm for OpenAICompatible {
                     let url = url.clone();
                     let api_key = api_key.clone();
                     let organization_id = organization_id.clone();
+                    let extra_headers = extra_headers.clone();
                     let body = body.clone();
                     let provider_name = provider_name.clone();
                     async move {
-                        send_request(&http, &url, &api_key, &organization_id, &body, &provider_name).await
+                        send_request(&http, &url, &api_key, &organization_id, &extra_headers, &body, &provider_name).await
                     }
                 })
                 .await?;
@@ -571,6 +592,14 @@ impl Llm for OpenAICompatible {
                 let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
                     HashMap::new();
                 let mut text_tool_buffer = crate::tool_call_parser::ToolCallBuffer::new();
+                // Content text streamed as partial `Part::Text` deltas. The
+                // tool-call final below restates it as ONE settled Text part
+                // so the final event honors the "partial=false carries the
+                // complete content" contract — without it, narration streamed
+                // before tool calls existed only as partials, never landing in
+                // the settled event (session history, persistence, and every
+                // frontend's settled-message view all lost it).
+                let mut accumulated_text = String::new();
                 // Usage seen on any chunk of this response. Strict OpenAI wire
                 // delivers it on a trailing `choices: []` chunk AFTER the
                 // `finish_reason` chunk (via `stream_options.include_usage`),
@@ -708,7 +737,31 @@ impl Llm for OpenAICompatible {
                                         tool_call_accumulators.drain().collect();
                                     sorted_calls.sort_by_key(|(idx, _)| *idx);
 
-                                    let parts: Vec<Part> = sorted_calls
+                                    // The finish chunk's own delta can still
+                                    // carry a content tail (it `continue`s past
+                                    // the partial-emission path below) — fold it
+                                    // in so it is not dropped.
+                                    if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                                        && !text.is_empty() {
+                                        accumulated_text.push_str(text);
+                                    }
+
+                                    let mut parts: Vec<Part> = Vec::with_capacity(
+                                        sorted_calls.len() + usize::from(!accumulated_text.is_empty()),
+                                    );
+                                    // Wire order is content before tool_calls:
+                                    // restate the streamed text as ONE settled
+                                    // Text part ahead of the calls. The agent's
+                                    // `collapse_duplicated_snapshot` recognizes
+                                    // the exact restate (deltas + snapshot with
+                                    // prefix == snapshot) and keeps one copy in
+                                    // the conversation history.
+                                    if !accumulated_text.is_empty() {
+                                        parts.push(Part::Text {
+                                            text: std::mem::take(&mut accumulated_text),
+                                        });
+                                    }
+                                    parts.extend(sorted_calls
                                         .into_iter()
                                         .map(|(_, (id, name, args_str))| {
                                             let args: serde_json::Value =
@@ -720,8 +773,7 @@ impl Llm for OpenAICompatible {
                                                 id: Some(id),
                                                 thought_signature: None,
                                             }
-                                        })
-                                        .collect();
+                                        }));
 
                                     held_final = Some(LlmResponse {
                                         content: Some(Content {
@@ -809,6 +861,9 @@ impl Llm for OpenAICompatible {
                                         crate::tool_call_parser::BufferAction::Emit(parts) => {
                                             for part in parts {
                                                 let is_tool = matches!(part, Part::FunctionCall { .. });
+                                                if let Part::Text { text } = &part {
+                                                    accumulated_text.push_str(text);
+                                                }
                                                 yield LlmResponse {
                                                     content: Some(Content {
                                                         role: "model".to_string(),
@@ -879,10 +934,11 @@ impl Llm for OpenAICompatible {
                     let base_url = base_url.clone();
                     let body = request_body.clone();
                     let organization_id = organization_id.clone();
+                    let extra_headers = extra_headers.clone();
                     async move {
                         let url = format!("{base_url}/chat/completions");
                         let http_resp =
-                            send_request(&http, &url, &api_key, &organization_id, &body, &provider_name)
+                            send_request(&http, &url, &api_key, &organization_id, &extra_headers, &body, &provider_name)
                                 .await?;
 
                         let raw_json: serde_json::Value = http_resp.json().await.map_err(|e| {
@@ -921,6 +977,21 @@ impl Llm for OpenAICompatible {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extra_headers_parse_at_client_construction() {
+        let config = OpenAICompatibleConfig::new("test-key", "test-model")
+            .with_extra_headers(vec![("X-Agent-Id".to_string(), "agent-7".to_string())]);
+        let client = OpenAICompatible::new(config).expect("client creation failed");
+        assert_eq!(client.extra_headers.get("x-agent-id").unwrap(), "agent-7");
+    }
+
+    #[test]
+    fn invalid_extra_header_name_fails_construction() {
+        let config = OpenAICompatibleConfig::new("test-key", "test-model")
+            .with_extra_headers(vec![("Bad Name".to_string(), "v".to_string())]);
+        assert!(OpenAICompatible::new(config).is_err());
+    }
 
     #[test]
     fn test_parallel_tool_calls_config() {
@@ -1093,6 +1164,46 @@ mod tests {
                 final_response.usage_metadata.as_ref().map(|u| u.total_token_count),
                 Some(24)
             );
+        }
+
+        /// Narration streamed as content deltas BEFORE the tool calls must
+        /// land in the settled final as one Text part ahead of the calls.
+        /// The settled event is the only thing persistence (and every
+        /// settled-message consumer — session history, the TUI's final
+        /// replace, the web actor) keeps; before the accumulation the text
+        /// existed only as partials and was silently dropped from the final.
+        #[tokio::test]
+        async fn streamed_text_lands_in_the_tool_call_final() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"我先看看目录。\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"再读 README。\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                     data: [DONE]\n\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let responses = drive(&test_client(server.uri())).await;
+
+            let final_response = responses
+                .iter()
+                .rev()
+                .find(|r| !r.partial)
+                .expect("a non-partial final must be emitted");
+            let content =
+                final_response.content.as_ref().expect("final must carry content");
+            // Wire order: the streamed text first, then the call.
+            match &content.parts[..] {
+                [Part::Text { text }, Part::FunctionCall { name, .. }] => {
+                    assert_eq!(text, "我先看看目录。再读 README。");
+                    assert_eq!(name, "read_file");
+                }
+                other => panic!("expected [Text, FunctionCall], got {other:?}"),
+            }
         }
 
         /// Servers that close the stream without `[DONE]`: the held final

@@ -44,6 +44,10 @@ impl AnthropicClient {
                 AdkError::model(format!("Invalid Anthropic base URL '{base_url}': {e}"))
             })?;
         }
+        if !config.extra_headers.is_empty() {
+            let extra_headers = crate::custom_headers::parse_extra_headers(&config.extra_headers)?;
+            client = client.with_extra_headers(extra_headers);
+        }
 
         Ok(Self {
             client,
@@ -790,6 +794,20 @@ mod tests {
     use super::*;
     use adk_anthropic::SystemPrompt;
     use adk_core::{Content, GenerateContentConfig, LlmRequest, Part};
+
+    #[test]
+    fn extra_headers_parse_at_client_construction() {
+        let config = AnthropicConfig::new("test-key", "claude-sonnet-4-6")
+            .with_extra_headers(vec![("X-Agent-Id".to_string(), "agent-7".to_string())]);
+        AnthropicClient::new(config).expect("client creation failed");
+    }
+
+    #[test]
+    fn invalid_extra_header_name_fails_construction() {
+        let config = AnthropicConfig::new("test-key", "claude-sonnet-4-6")
+            .with_extra_headers(vec![("Bad Name".to_string(), "v".to_string())]);
+        assert!(AnthropicClient::new(config).is_err());
+    }
 
     fn make_request(contents: Vec<Content>) -> LlmRequest {
         LlmRequest {

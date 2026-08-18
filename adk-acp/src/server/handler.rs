@@ -1,8 +1,33 @@
 //! ACP session lifecycle and ADK-Rust Runner bridge.
+//!
+//! # Session activation semantics (for ACP client authors)
+//!
+//! The active-session map is process-level: one entry per activated session,
+//! shared by every connection the server serves (the HTTP transport hands a
+//! clone of the same handler to each inbound connection). An entry is a
+//! marker, not a lease owned by a connection. `session/load` or
+//! `session/resume` for a session whose last turn already finished — or whose
+//! activating connection went away without sending `session/close` — simply
+//! rebinds the entry to the requesting connection. A client that opens a
+//! fresh connection per turn therefore needs no `session/close` to continue a
+//! session; it can `session/load` the same id from each new connection.
+//!
+//! The rebind is refused only while a prompt is still executing in the
+//! session. That liveness is tracked by a drop-guarded probe
+//! ([`InFlightPrompt`]), so even a prompt abandoned mid-run when its
+//! connection died stops blocking as soon as the SDK drops the task. Two
+//! connections may still alternate prompts on one session; each individual
+//! turn remains serial (the in-flight guard in
+//! [`handle_prompt`](AcpSessionHandler::handle_prompt) rejects concurrent
+//! turns).
+//!
+//! Explicit `session/close` keeps its original meaning: it marks the session
+//! inactive without deleting its persisted history.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use adk_core::{
@@ -16,7 +41,7 @@ use adk_tool::McpToolset;
 use adk_tool::mcp::McpHttpClientBuilder;
 use agent_client_protocol::RequestCancellation;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ListSessionsRequest, ListSessionsResponse, McpServer, NewSessionRequest,
+    ContentBlock, ListSessionsRequest, ListSessionsResponse, McpServer, Meta, NewSessionRequest,
     PromptRequest, SessionId, SessionInfo, SessionNotification, StopReason,
 };
 use agent_client_protocol::{Client, ConnectionTo};
@@ -26,7 +51,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::config::AcpServerConfig;
+use super::config::{AcpServerConfig, AgentFactory};
 use super::error::AcpServerError;
 use super::modes::{
     self, SessionControls, config_state_key, config_value_is_valid, mode_is_advertised,
@@ -51,8 +76,74 @@ const TITLE_STATE_KEY: &str = "acp:title";
 const MCP_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct SessionState {
-    execution_token: Option<CancellationToken>,
+    execution: Option<InFlightPrompt>,
     mcp: McpSessionResources,
+    /// Per-session agent composed by the configured [`AgentFactory`] from the
+    /// session's `_meta` map and cwd. `None` (no factory configured, or a
+    /// load-without-`_meta` that chose to keep nothing) means the
+    /// config-level agent serves this session; `create_session` composes
+    /// every session when a factory exists (an absent `_meta` is an empty
+    /// map there). Preserved across load/resume rebinds so a client that
+    /// pinned a model on `session/new` keeps it on a later `session/load`
+    /// without re-sending `_meta`.
+    agent: Option<Arc<dyn Agent>>,
+}
+
+/// Liveness probe for the prompt currently executing in a session.
+///
+/// The session map holds one cheap clone; the prompt task's frame holds the
+/// matching [`InFlightGuard`]. The probe reports "running" until the guard is
+/// dropped, so every exit path — normal completion, early error return, and
+/// the prompt future being dropped mid-execution when its ACP connection dies
+/// (the official SDK tears down a connection's task actor on transport
+/// failure, which drops `handle_prompt`'s future without running its tail) —
+/// releases the session instead of leaving it permanently busy.
+///
+/// This is what makes idle-rebinding safe: a session can only be rebound by
+/// `session/load` / `session/resume` when no live prompt holds it.
+#[derive(Clone)]
+struct InFlightPrompt {
+    inner: Arc<InFlightInner>,
+}
+
+struct InFlightInner {
+    token: CancellationToken,
+    finished: AtomicBool,
+}
+
+/// Task-side half of [`InFlightPrompt`]. Held on the `handle_prompt` frame;
+/// dropping it flips the probe to "not running" on every exit path, including
+/// an abrupt drop of the future itself.
+struct InFlightGuard {
+    inner: Arc<InFlightInner>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.inner.finished.store(true, Ordering::Release);
+    }
+}
+
+impl InFlightPrompt {
+    /// Start tracking a prompt: returns the map-side probe plus the guard the
+    /// prompt task must hold for as long as it executes.
+    fn start() -> (Self, InFlightGuard) {
+        let inner = Arc::new(InFlightInner {
+            token: CancellationToken::new(),
+            finished: AtomicBool::new(false),
+        });
+        (Self { inner: inner.clone() }, InFlightGuard { inner })
+    }
+
+    /// Whether the tracked prompt is still executing.
+    fn is_running(&self) -> bool {
+        !self.inner.finished.load(Ordering::Acquire)
+    }
+
+    /// Token that cancels the tracked prompt's runner.
+    fn token(&self) -> &CancellationToken {
+        &self.inner.token
+    }
 }
 
 #[derive(Default)]
@@ -75,10 +166,25 @@ impl Drop for McpSessionResources {
 /// service. One ACP session maps one-to-one to one ADK-Rust session.
 pub struct AcpSessionHandler {
     agent: Arc<dyn Agent>,
+    /// Optional per-session agent factory (request `_meta` overrides). When
+    /// `None`, `agent` serves every session — unchanged legacy behaviour.
+    agent_factory: Option<Arc<dyn AgentFactory>>,
     session_service: Arc<dyn SessionService>,
     app_name: String,
     user_id: String,
     max_sessions: usize,
+    /// Process-level map of active sessions, shared by every ACP connection
+    /// the server serves (the HTTP transport clones this handler per inbound
+    /// connection).
+    ///
+    /// An entry marks a session as *activated*; it is not a lease owned by
+    /// any one connection. `session/load` / `session/resume` arriving for an
+    /// idle entry — the previous turn finished, or the activating connection
+    /// is gone — rebind the entry to the requesting connection (replacing the
+    /// entry tears down the previous entry's MCP server children). A rebind
+    /// is refused only while a prompt is still executing; see
+    /// [`InFlightPrompt`]. This is what lets per-turn HTTP clients continue a
+    /// session from a fresh connection without sending `session/close`.
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
     shutdown_token: CancellationToken,
     session_controls: Option<Arc<dyn SessionControls>>,
@@ -242,6 +348,7 @@ impl AcpSessionHandler {
     ) -> Result<Self, AcpServerError> {
         Ok(Self {
             agent: config.agent.clone(),
+            agent_factory: config.agent_factory.clone(),
             session_service: config.session_service.clone(),
             app_name: config.agent_name.clone(),
             user_id: config.user_id.clone(),
@@ -263,6 +370,16 @@ impl AcpSessionHandler {
         for directory in &request.additional_directories {
             validate_absolute(directory, "additionalDirectories")?;
         }
+        // Per-session agent first: a factory failure (invalid `_meta`
+        // overrides) rejects the request before any registry or persistence
+        // side effect needs unwinding. With a factory configured, **every**
+        // new session routes through it — a request without `_meta` is
+        // normalized to an empty map (the factory's base composition), so
+        // per-cwd concerns (file-domain binding) cover plain sessions too,
+        // not only override-carrying ones.
+        let empty_meta = serde_json::Map::new();
+        let session_agent = self
+            .build_session_agent(Some(request.meta.as_ref().unwrap_or(&empty_meta)), &request.cwd)?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let mut state = HashMap::new();
         state.insert(
@@ -282,7 +399,11 @@ impl AcpSessionHandler {
             }
             sessions.insert(
                 session_id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
+                SessionState {
+                    execution: None,
+                    mcp: McpSessionResources::default(),
+                    agent: session_agent,
+                },
             );
         }
 
@@ -318,6 +439,13 @@ impl AcpSessionHandler {
     }
 
     /// Resume a persisted session and make it active on this ACP connection.
+    ///
+    /// When the session is already active but idle — its previous turn
+    /// finished, or the connection that activated it is gone — the activation
+    /// is rebound to this connection instead of being rejected, so a client
+    /// never needs `session/close` to recover from an unclean disconnect. A
+    /// session with a prompt still executing is refused (see
+    /// [`register_session_entry`](Self::register_session_entry)).
     pub async fn resume_session(
         &self,
         session_id: &SessionId,
@@ -355,21 +483,7 @@ impl AcpSessionHandler {
                 "resumed session cwd does not match its original cwd".into(),
             ));
         }
-        {
-            let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(&id) {
-                return Err(AcpServerError::Execution(
-                    "the session is already active on this ACP connection".into(),
-                ));
-            }
-            if sessions.len() >= self.max_sessions {
-                return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
-            }
-            sessions.insert(
-                id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
-            );
-        }
+        self.register_session_entry(&id).await?;
         let mcp = match start_mcp_servers(&mcp_servers, &cwd, &request_cancellation).await {
             Ok(resources) => resources,
             Err(error) => {
@@ -390,10 +504,11 @@ impl AcpSessionHandler {
     /// Reactivation mirrors [`resume_session`](Self::resume_session): the
     /// working directory must be absolute and match the session's stored `cwd`,
     /// the session must exist for the configured application and user, and the
-    /// session is registered on the connection (subject to the max-session and
-    /// already-active checks) with its MCP servers started. After reactivation,
-    /// every stored event is mapped to its `SessionUpdate` variant through the
-    /// shared [`ResponseStreamer`] and sent in chronological order.
+    /// session is registered on the connection (rebinding any idle activation
+    /// left behind by a previous connection; a still-executing prompt is
+    /// refused) with its MCP servers started. After reactivation, every stored
+    /// event is mapped to its `SessionUpdate` variant through the shared
+    /// [`ResponseStreamer`] and sent in chronological order.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_session(
         &self,
@@ -403,6 +518,7 @@ impl AcpSessionHandler {
         mcp_servers: Vec<McpServer>,
         request_cancellation: RequestCancellation,
         connection: ConnectionTo<Client>,
+        meta: Option<Meta>,
     ) -> Result<(), AcpServerError> {
         self.ensure_running()?;
         validate_absolute(&cwd, "cwd")?;
@@ -433,21 +549,15 @@ impl AcpSessionHandler {
                 "loaded session cwd does not match its original cwd".into(),
             ));
         }
-        {
-            let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(&id) {
-                return Err(AcpServerError::Execution(
-                    "the session is already active on this ACP connection".into(),
-                ));
-            }
-            if sessions.len() >= self.max_sessions {
-                return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
-            }
-            sessions.insert(
-                id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
-            );
-        }
+        // `_meta` on load: a factory-equipped server rebuilds the session's
+        // agent from the fresh overrides (clients re-send their pinned model
+        // every turn). Absent `_meta` keeps whatever the entry already
+        // carries — register_session_entry preserves it across the rebind,
+        // so a plain reconnect never implicitly switches model or file
+        // domain. Built before registration so a factory failure leaves the
+        // session untouched.
+        let rebuilt_agent = self.build_session_agent(meta.as_ref(), &cwd)?;
+        self.register_session_entry(&id).await?;
         let mcp = match start_mcp_servers(&mcp_servers, &cwd, &request_cancellation).await {
             Ok(resources) => resources,
             Err(error) => {
@@ -457,6 +567,9 @@ impl AcpSessionHandler {
         };
         if let Some(session) = self.sessions.lock().await.get_mut(&id) {
             session.mcp = mcp;
+            if rebuilt_agent.is_some() {
+                session.agent = rebuilt_agent;
+            }
         }
 
         // Replay the stored conversation in chronological order. `events().all()`
@@ -543,9 +656,19 @@ impl AcpSessionHandler {
             if sessions.len() >= self.max_sessions {
                 return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
             }
+            // The fork inherits the source's factory-composed agent (if any):
+            // branching a conversation must not silently flip its model. A
+            // fork request carries no `_meta`, so this is the only continuity
+            // the fork gets.
+            let inherited_agent =
+                sessions.get(&source_id).and_then(|state| state.agent.clone());
             sessions.insert(
                 new_session_id.clone(),
-                SessionState { execution_token: None, mcp: McpSessionResources::default() },
+                SessionState {
+                    execution: None,
+                    mcp: McpSessionResources::default(),
+                    agent: inherited_agent,
+                },
             );
         }
 
@@ -656,9 +779,10 @@ impl AcpSessionHandler {
     /// Delete persisted session history and release any active execution.
     pub async fn delete_session(&self, session_id: &SessionId) -> Result<(), AcpServerError> {
         if let Some(state) = self.sessions.lock().await.remove(&session_id.to_string())
-            && let Some(token) = state.execution_token
+            && let Some(probe) = state.execution
+            && probe.is_running()
         {
-            token.cancel();
+            probe.token().cancel();
         }
         self.session_service
             .delete(DeleteRequest {
@@ -679,29 +803,38 @@ impl AcpSessionHandler {
     ) -> Result<StopReason, AcpServerError> {
         self.ensure_running()?;
         let id = request.session_id.to_string();
-        let (cancellation_token, runtime_toolsets) = {
+        let (cancellation_token, prompt_guard, runtime_toolsets, session_agent) = {
             let mut sessions = self.sessions.lock().await;
             let state =
                 sessions.get_mut(&id).ok_or_else(|| AcpServerError::SessionNotFound(id.clone()))?;
-            if state.execution_token.is_some() {
+            if state.execution.as_ref().is_some_and(InFlightPrompt::is_running) {
                 return Err(AcpServerError::Execution(
                     "a prompt is already running in this session".into(),
                 ));
             }
-            let token = CancellationToken::new();
-            state.execution_token = Some(token.clone());
-            (token, state.mcp.toolsets.clone())
+            let (probe, guard) = InFlightPrompt::start();
+            let token = probe.token().clone();
+            state.execution = Some(probe);
+            let session_agent = state.agent.clone();
+            (token, guard, state.mcp.toolsets.clone(), session_agent)
         };
 
         let result = self
-            .execute_prompt(&request, connection, cancellation_token.clone(), runtime_toolsets)
+            .execute_prompt(
+                &request,
+                connection,
+                cancellation_token.clone(),
+                runtime_toolsets,
+                session_agent,
+            )
             .await;
 
-        let mut sessions = self.sessions.lock().await;
-        if let Some(state) = sessions.get_mut(&id) {
-            state.execution_token = None;
-        }
-        drop(sessions);
+        // Dropping the guard marks the session idle on every exit path —
+        // including this future being dropped mid-execution when its
+        // connection dies, in which case this line never runs and Drop does
+        // the work instead. No map mutation is needed here, which also keeps
+        // a finished turn from touching an entry a later load rebound.
+        drop(prompt_guard);
 
         if cancellation_token.is_cancelled() {
             return Ok(StopReason::Cancelled);
@@ -715,6 +848,7 @@ impl AcpSessionHandler {
         connection: ConnectionTo<Client>,
         cancellation_token: CancellationToken,
         runtime_toolsets: Vec<Arc<dyn Toolset>>,
+        session_agent: Option<Arc<dyn Agent>>,
     ) -> Result<StopReason, AcpServerError> {
         let content = prompt_content(&request.prompt)?;
         let user_id = UserId::new(self.user_id.clone())
@@ -753,7 +887,7 @@ impl AcpSessionHandler {
             .build();
         let runner = Runner::builder()
             .app_name(&self.app_name)
-            .agent(self.agent.clone())
+            .agent(session_agent.unwrap_or_else(|| self.agent.clone()))
             .session_service(self.session_service.clone())
             .cancellation_token(cancellation_token.clone())
             .run_config(run_config)
@@ -827,20 +961,29 @@ impl AcpSessionHandler {
             .lock()
             .await
             .get(&session_id.to_string())
-            .and_then(|state| state.execution_token.clone())
+            .and_then(|state| state.execution.as_ref())
+            .filter(|probe| probe.is_running())
+            .map(|probe| probe.token().clone())
         {
             token.cancel();
         }
     }
 
     /// Close an active session without deleting its persisted history.
+    ///
+    /// The session is marked inactive (its MCP server children are torn down);
+    /// a later `session/load` / `session/resume` reactivates it with its full
+    /// history intact. Closing an idle session that was already rebound by
+    /// another connection affects only the current activation.
     pub async fn close_session(&self, session_id: &SessionId) -> Result<(), AcpServerError> {
         let mut sessions = self.sessions.lock().await;
         let state = sessions
             .remove(&session_id.to_string())
             .ok_or_else(|| AcpServerError::SessionNotFound(session_id.to_string()))?;
-        if let Some(token) = state.execution_token {
-            token.cancel();
+        if let Some(probe) = state.execution
+            && probe.is_running()
+        {
+            probe.token().cancel();
         }
         Ok(())
     }
@@ -1119,6 +1262,76 @@ impl AcpSessionHandler {
         Ok(())
     }
 
+    /// Compose a per-session agent via the configured [`AgentFactory`], if any.
+    ///
+    /// Only an explicit `_meta` map (`Some`) reaches the factory here — but
+    /// `create_session` normalizes an absent `_meta` to an empty map before
+    /// calling, so on the create path a factory-equipped server composes
+    /// **every** session (empty map = the factory's base composition plus
+    /// whatever cwd binding it applies). `load_session` passes its `Option`
+    /// through verbatim: a load without `_meta` keeps whatever agent the
+    /// entry already carries (register_session_entry preserves it across the
+    /// rebind). The session `cwd` rides along verbatim (the request-level
+    /// `validate_absolute` already ran). A factory error is loud: the session
+    /// request fails instead of degrading to the config-level agent.
+    fn build_session_agent(
+        &self,
+        meta: Option<&Meta>,
+        cwd: &Path,
+    ) -> Result<Option<Arc<dyn Agent>>, AcpServerError> {
+        let (Some(factory), Some(map)) = (self.agent_factory.as_ref(), meta) else {
+            return Ok(None);
+        };
+        let agent = factory
+            .build(map, cwd)
+            .map_err(|e| AcpServerError::MalformedMessage(format!("session _meta rejected: {e}")))?;
+        Ok(Some(agent))
+    }
+
+    /// Register a session as active in the process-level map, rebinding idle
+    /// entries left behind by earlier connections.
+    ///
+    /// An entry whose prompt is still executing ([`InFlightPrompt::is_running`])
+    /// blocks the registration: two connections may not run turns on one
+    /// session at the same time, and the in-flight guard in
+    /// [`handle_prompt`](Self::handle_prompt) keeps every other connection
+    /// serial with the running turn too. An idle entry — the previous turn
+    /// finished, or the activating connection went away — is replaced in
+    /// place; dropping the old entry tears down its MCP server children, which
+    /// is exactly what a fresh `session/load` / `session/resume` wants. A
+    /// rebinding registration does not grow the map, so `max_sessions` is
+    /// checked only for genuinely new entries.
+    async fn register_session_entry(&self, id: &str) -> Result<(), AcpServerError> {
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(id)
+            .and_then(|state| state.execution.as_ref())
+            .is_some_and(InFlightPrompt::is_running)
+        {
+            return Err(AcpServerError::Execution(
+                "the session is already active on this ACP connection: a prompt is running"
+                    .into(),
+            ));
+        }
+        let rebinding = sessions.contains_key(id);
+        if !rebinding && sessions.len() >= self.max_sessions {
+            return Err(AcpServerError::MaxSessionsReached(self.max_sessions));
+        }
+        // A rebind replaces the entry wholesale; carry any factory-composed
+        // agent over so a session pinned on `session/new` keeps its model on
+        // a later load/resume that re-registers it.
+        let preserved_agent = sessions.get(id).and_then(|state| state.agent.clone());
+        sessions.insert(
+            id.to_string(),
+            SessionState {
+                execution: None,
+                mcp: McpSessionResources::default(),
+                agent: preserved_agent,
+            },
+        );
+        Ok(())
+    }
+
     /// Persist a single session-state key by appending a state-delta event.
     ///
     /// The event carries no content, so it produces no `session/update` on
@@ -1147,8 +1360,10 @@ impl AcpSessionHandler {
     pub async fn drain_sessions(&self, _timeout: std::time::Duration) {
         let mut sessions = self.sessions.lock().await;
         for state in sessions.values() {
-            if let Some(token) = &state.execution_token {
-                token.cancel();
+            if let Some(probe) = &state.execution
+                && probe.is_running()
+            {
+                probe.token().cancel();
             }
         }
         sessions.clear();
@@ -1384,16 +1599,25 @@ fn prompt_content(blocks: &[ContentBlock]) -> Result<Content, AcpServerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use adk_core::{Event, EventStream, InvocationContext, Result as AdkResult};
+    use agent_client_protocol::Agent as AcpAgentRole;
+    use agent_client_protocol::schema::ProtocolVersion;
     use agent_client_protocol::schema::v1::{
-        AudioContent, EmbeddedResource as AcpEmbeddedResource, EmbeddedResourceResource,
-        EnvVariable, ImageContent, McpServerStdio, TextContent,
+        AudioContent, CloseSessionRequest, EmbeddedResource as AcpEmbeddedResource,
+        EmbeddedResourceResource, EnvVariable, ImageContent, InitializeRequest,
+        LoadSessionRequest, McpServerStdio, NewSessionRequest, ResumeSessionRequest, TextContent,
         TextResourceContents as AcpTextResourceContents,
     };
+    use agent_client_protocol::Channel;
     use base64::{Engine as _, engine::general_purpose};
+    use tokio::sync::Notify;
 
-    use super::super::capabilities::CapabilitiesBuilder;
+    use super::super::capabilities::{AgentCapabilities, CapabilitiesBuilder};
     use super::super::config::AcpServerConfigBuilder;
     use super::super::test_helpers::mock_agent_and_session;
+    use super::super::transport::stdio::serve_connection;
     use super::*;
 
     /// The advertised prompt capabilities must correspond exactly to the content
@@ -1497,6 +1721,1073 @@ mod tests {
                 .expect_err("duplicate environment")
                 .to_string()
                 .contains("repeats environment variable")
+        );
+    }
+
+    /// An agent whose turn hangs until released, so a test can hold a prompt
+    /// in flight while another connection arrives.
+    struct GatedAgent {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for GatedAgent {
+        fn name(&self) -> &str {
+            "gated-agent"
+        }
+
+        fn description(&self) -> &str {
+            "Hangs each turn until released"
+        }
+
+        fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+            &[]
+        }
+
+        async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> AdkResult<EventStream> {
+            self.started.notify_one();
+            self.release.notified().await;
+            let mut event = Event::new("gated-agent");
+            event.set_content(Content::new("model").with_text("released"));
+            Ok(Box::pin(futures::stream::once(async move { Ok(event) })))
+        }
+    }
+
+    /// Client-side work for [`spawn_acp_connection`]: receives the client's
+    /// connection and returns the future driving it. Boxed so the connection
+    /// spawner stays one concrete type regardless of what a test captures.
+    type ClientWork = Box<
+        dyn FnOnce(
+                ConnectionTo<AcpAgentRole>,
+            ) -> futures::future::BoxFuture<'static, Result<(), agent_client_protocol::Error>>
+            + Send,
+    >;
+
+    /// Task handle for one half (server or client side) of a spawned
+    /// in-memory ACP connection.
+    type ConnectionTask = tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>;
+
+    /// Spawn one fresh in-memory ACP connection (official client + agent
+    /// component pair) sharing `handler` — the per-connection shape the HTTP
+    /// transport's factory produces, so "call this twice" means "two clients,
+    /// two connections, one process-level handler".
+    ///
+    /// Returns the server-side and client-side tasks. Awaiting the client task
+    /// asserts the whole connection succeeded; aborting the server task
+    /// simulates the connection dying (the SDK drops the connection's task
+    /// actor, and with it any prompt still executing).
+    fn spawn_acp_connection(
+        handler: Arc<AcpSessionHandler>,
+        capabilities: AgentCapabilities,
+        client_work: ClientWork,
+    ) -> (ConnectionTask, ConnectionTask) {
+        let (server_channel, client_channel) = Channel::duplex();
+        let server = tokio::spawn(serve_connection(
+            handler,
+            capabilities,
+            "test-agent".into(),
+            "Session rebind test agent".into(),
+            server_channel,
+        ));
+        let client = tokio::spawn(async move {
+            Client
+                .builder()
+                .connect_with(client_channel, move |connection| async move {
+                    client_work(connection).await
+                })
+                .await
+        });
+        (server, client)
+    }
+
+    /// Initialize a session on a fresh connection. Shared by the rebind tests.
+    async fn initialize_and_create_session(
+        connection: &ConnectionTo<AcpAgentRole>,
+    ) -> Result<(SessionId, PathBuf), agent_client_protocol::Error> {
+        connection
+            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+            .block_task()
+            .await?;
+        let cwd = std::env::current_dir().expect("absolute cwd");
+        let session = connection
+            .send_request(NewSessionRequest::new(cwd.clone()))
+            .block_task()
+            .await?;
+        Ok((session.session_id, cwd))
+    }
+
+    /// **Session activation rebind**: once a session's turn has finished, a
+    /// *new* connection can `session/load` it and a third connection can
+    /// `session/resume` it — with no `session/close` in between. The idle
+    /// activation left by connection 1 is rebound, not rejected. With
+    /// `max_sessions = 1`, this also pins that rebinding does not consume a
+    /// new session slot.
+    #[tokio::test]
+    async fn idle_session_rebinds_to_new_connections_without_close() {
+        let (agent, session_service) = mock_agent_and_session();
+        let config = AcpServerConfigBuilder::new()
+            .agent(agent)
+            .session_service(session_service)
+            .agent_name("test-agent")
+            .max_sessions(1)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        // Connection 1: create the session, run one turn to completion. No
+        // session/close is ever sent and the connection is simply dropped.
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let (server1, client1) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    let (session_id, cwd) = initialize_and_create_session(&connection).await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("hello"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    let _ = session_tx.send((session_id, cwd));
+                    Ok(())
+                })
+            }),
+        );
+        // The oneshot fires only after the prompt response arrived, and the
+        // in-flight probe is released before that response is sent, so the
+        // session is guaranteed idle from here on.
+        let (session_id, cwd) = session_rx.await.expect("connection 1 completed its turn");
+        server1.abort();
+        let _ = server1.await;
+        let _ = client1.await;
+
+        // Connection 2 (a fresh connection, like the next per-turn HTTP
+        // request): loading the same session must succeed.
+        let load_session_id = session_id.clone();
+        let load_cwd = cwd.clone();
+        let (_server2, client2) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(load_session_id, load_cwd))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client2)
+            .await
+            .expect("connection 2 load completed before timeout")
+            .expect("official ACP client completed")
+            .expect("connection 2 load succeeded without session/close");
+
+        // Connection 3: the rebound (still idle) entry rebinds again.
+        let (_server3, client3) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(ResumeSessionRequest::new(session_id, cwd))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client3)
+            .await
+            .expect("connection 3 resume completed before timeout")
+            .expect("official ACP client completed")
+            .expect("connection 3 resume succeeded without session/close");
+    }
+
+    /// **Busy refusal**: while a prompt is executing on one connection,
+    /// `session/load` and `session/resume` from another connection are both
+    /// refused. Once the turn finishes, the very next load succeeds.
+    #[tokio::test]
+    async fn load_and_resume_are_refused_only_while_a_prompt_is_running() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let agent: Arc<dyn Agent> = Arc::new(GatedAgent {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let session_service: Arc<dyn SessionService> =
+            Arc::new(adk_session::InMemorySessionService::new());
+        let config = AcpServerConfigBuilder::new()
+            .agent(agent)
+            .session_service(session_service)
+            .agent_name("gated-agent")
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        // Connection 1: start a prompt that hangs inside the agent.
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let (_server1, client1) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    let (session_id, cwd) = initialize_and_create_session(&connection).await?;
+                    let _ = session_tx.send((session_id.clone(), cwd));
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new("hang"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        let (session_id, cwd) = session_rx.await.expect("connection 1 created the session");
+        // The agent only starts once the prompt's in-flight probe is set, so
+        // this notification means the session is genuinely busy.
+        started.notified().await;
+
+        // Connection 2: both load and resume are refused while it runs.
+        let busy_session_id = session_id.clone();
+        let busy_cwd = cwd.clone();
+        let (_server2, client2) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let refused_load = connection
+                        .send_request(LoadSessionRequest::new(
+                            busy_session_id.clone(),
+                            busy_cwd.clone(),
+                        ))
+                        .block_task()
+                        .await
+                        .expect_err(
+                            "load must be refused while the session's prompt is running",
+                        );
+                    assert!(
+                        refused_load.to_string().contains("already active"),
+                        "expected an already-active refusal, got: {refused_load}"
+                    );
+                    let refused_resume = connection
+                        .send_request(ResumeSessionRequest::new(busy_session_id, busy_cwd))
+                        .block_task()
+                        .await
+                        .expect_err(
+                            "resume must be refused while the session's prompt is running",
+                        );
+                    assert!(
+                        refused_resume.to_string().contains("already active"),
+                        "expected an already-active refusal, got: {refused_resume}"
+                    );
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client2)
+            .await
+            .expect("connection 2 refusals completed before timeout")
+            .expect("official ACP client completed")
+            .expect("connection 2 saw both refusals");
+
+        // Finish the turn, then the same load from a third connection works.
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), client1)
+            .await
+            .expect("connection 1 turn completed before timeout")
+            .expect("official ACP client completed")
+            .expect("connection 1 turn succeeded");
+
+        let (_server3, client3) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(session_id, cwd))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client3)
+            .await
+            .expect("connection 3 load completed before timeout")
+            .expect("official ACP client completed")
+            .expect("load must succeed once the turn finished");
+    }
+
+    /// **Explicit close**: `session/close` still releases the activation
+    /// without deleting history — a new connection can then load the session
+    /// (its stored turn is replayed) and run a full follow-up turn.
+    #[tokio::test]
+    async fn close_then_load_from_a_new_connection_succeeds() {
+        let (agent, session_service) = mock_agent_and_session();
+        let config = AcpServerConfigBuilder::new()
+            .agent(agent)
+            .session_service(session_service)
+            .agent_name("test-agent")
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        // Connection 1: create the session and complete one turn.
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let (server1, client1) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    let (session_id, cwd) = initialize_and_create_session(&connection).await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("hello"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    let _ = session_tx.send((session_id, cwd));
+                    Ok(())
+                })
+            }),
+        );
+        let (session_id, cwd) = session_rx.await.expect("connection 1 completed its turn");
+        server1.abort();
+        let _ = server1.await;
+        let _ = client1.await;
+
+        // Connection 2: close the session, then load it from the same new
+        // connection. The load must succeed, replay the stored turn, and
+        // leave the session able to run another full turn.
+        let updates = Arc::new(Mutex::new(Vec::<SessionUpdate>::new()));
+        let updates_for_client = updates.clone();
+        let (server2, client2) = {
+            let (server_channel, client_channel) = Channel::duplex();
+            let server = tokio::spawn(serve_connection(
+                handler,
+                capabilities,
+                "test-agent".into(),
+                "Close-then-load test agent".into(),
+                server_channel,
+            ));
+            let client = tokio::spawn(
+                Client
+                    .builder()
+                    .on_receive_notification(
+                        async move |notification: SessionNotification,
+                                    _connection: ConnectionTo<AcpAgentRole>| {
+                            updates_for_client
+                                .lock()
+                                .expect("updates lock")
+                                .push(notification.update);
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
+                    .connect_with(client_channel, move |connection: ConnectionTo<AcpAgentRole>| async move {
+                        connection
+                            .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task()
+                            .await?;
+                        connection
+                            .send_request(CloseSessionRequest::new(session_id.clone()))
+                            .block_task()
+                            .await?;
+                        connection
+                            .send_request(LoadSessionRequest::new(session_id.clone(), cwd))
+                            .block_task()
+                            .await?;
+                        let follow_up = connection
+                            .send_request(PromptRequest::new(
+                                session_id,
+                                vec![ContentBlock::Text(TextContent::new("again"))],
+                            ))
+                            .block_task()
+                            .await?;
+                        assert_eq!(follow_up.stop_reason, StopReason::EndTurn);
+                        Ok(())
+                    }),
+            );
+            (server, client)
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), client2)
+            .await
+            .expect("connection 2 close+load completed before timeout")
+            .expect("official ACP client completed")
+            .expect("connection 2 close+load+prompt succeeded");
+        server2.abort();
+        let _ = server2.await;
+
+        // One replayed chunk from the load plus one live chunk from the
+        // follow-up turn: close deleted neither the history nor the session's
+        // ability to keep working.
+        let replayed_and_live = updates
+            .lock()
+            .expect("updates lock")
+            .iter()
+            .filter(|update| {
+                matches!(
+                    update,
+                    SessionUpdate::AgentMessageChunk(chunk)
+                        if matches!(&chunk.content, ContentBlock::Text(text)
+                            if text.text == "mock response")
+                )
+            })
+            .count();
+        assert!(
+            replayed_and_live >= 2,
+            "expected the replayed turn and the follow-up turn, got {replayed_and_live} chunks"
+        );
+    }
+
+    /// **Abandoned connection**: a prompt still executing when its connection
+    /// dies (here: the server task is killed mid-turn, which drops the prompt
+    /// future exactly like a transport failure does) must stop blocking
+    /// `session/load` — the drop-guarded in-flight probe releases the session
+    /// without any cleanup code running. The new connection can then load and
+    /// keep using the session.
+    #[tokio::test]
+    async fn abandoned_connection_mid_prompt_releases_the_session() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let agent: Arc<dyn Agent> = Arc::new(GatedAgent {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let session_service: Arc<dyn SessionService> =
+            Arc::new(adk_session::InMemorySessionService::new());
+        let config = AcpServerConfigBuilder::new()
+            .agent(agent)
+            .session_service(session_service)
+            .agent_name("gated-agent")
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        // Connection 1: start a hanging prompt, then kill the whole
+        // connection while it runs.
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let (server1, _client1) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    let (session_id, cwd) = initialize_and_create_session(&connection).await?;
+                    let _ = session_tx.send((session_id.clone(), cwd));
+                    let _prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new("hang"))],
+                        ))
+                        .block_task()
+                        .await;
+                    Ok(())
+                })
+            }),
+        );
+        let (session_id, cwd) = session_rx.await.expect("connection 1 created the session");
+        started.notified().await;
+        server1.abort();
+        let _ = server1.await;
+        // Store the release permit now: the abandoned turn's `notified()` future
+        // is already dropped with the connection, so the permit goes to the
+        // takeover turn below (Notify permits persist until a waiter arrives).
+        release.notify_one();
+
+        // Connection 2: the abandoned prompt must not block the load, and the
+        // rebound session must run a full turn.
+        let (_server2, client2) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(session_id.clone(), cwd))
+                        .block_task()
+                        .await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new("take over"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client2)
+            .await
+            .expect("connection 2 takeover completed before timeout")
+            .expect("official ACP client completed")
+            .expect("load and takeover prompt must succeed after the connection died");
+    }
+
+    // ── per-session agent factory (`_meta` overrides) ─────────────────────
+
+    /// A factory whose every `build` call records the `_meta` map and cwd it
+    /// received and returns an agent that records its factory-call index
+    /// when run.
+    struct RecordingFactory {
+        metas: Arc<Mutex<Vec<String>>>,
+        cwds: Arc<Mutex<Vec<String>>>,
+        served_by: Arc<Mutex<Vec<String>>>,
+        fail: bool,
+    }
+
+    impl RecordingFactory {
+        fn new() -> Self {
+            Self {
+                metas: Arc::new(Mutex::new(Vec::new())),
+                cwds: Arc::new(Mutex::new(Vec::new())),
+                served_by: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            }
+        }
+    }
+
+    impl super::super::config::AgentFactory for RecordingFactory {
+        fn build(
+            &self,
+            meta: &serde_json::Map<String, serde_json::Value>,
+            cwd: &std::path::Path,
+        ) -> Result<Arc<dyn Agent>, String> {
+            if self.fail {
+                return Err("bad override value".to_string());
+            }
+            let index = self.metas.lock().unwrap().len();
+            self.metas
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(meta).expect("meta serializes"));
+            self.cwds
+                .lock()
+                .unwrap()
+                .push(cwd.display().to_string());
+            Ok(Arc::new(FactoryAgent {
+                marker: format!("call-{index}"),
+                served_by: self.served_by.clone(),
+            }))
+        }
+    }
+
+    struct FactoryAgent {
+        marker: String,
+        served_by: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for FactoryAgent {
+        fn name(&self) -> &str {
+            "factory-agent"
+        }
+
+        fn description(&self) -> &str {
+            "Records which factory call produced it when run"
+        }
+
+        fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+            &[]
+        }
+
+        async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> AdkResult<EventStream> {
+            self.served_by.lock().unwrap().push(self.marker.clone());
+            let mut event = Event::new("factory-agent");
+            event.set_content(adk_core::Content::new("model").with_text("factory response"));
+            Ok(Box::pin(futures::stream::once(async move { Ok(event) })))
+        }
+    }
+
+    fn override_meta(model: &str) -> Meta {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "agentx/model".to_string(),
+            serde_json::Value::String(model.to_string()),
+        );
+        map
+    }
+
+    /// A config-level base agent that records when it runs, so a test can
+    /// tell base-served turns from factory-served ones.
+    struct RecordingBaseAgent {
+        served: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Agent for RecordingBaseAgent {
+        fn name(&self) -> &str {
+            "recording-base-agent"
+        }
+
+        fn description(&self) -> &str {
+            "Records that it ran"
+        }
+
+        fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+            &[]
+        }
+
+        async fn run(&self, _ctx: Arc<dyn InvocationContext>) -> AdkResult<EventStream> {
+            *self.served.lock().unwrap() = true;
+            let mut event = Event::new("recording-base-agent");
+            event.set_content(adk_core::Content::new("model").with_text("base response"));
+            Ok(Box::pin(futures::stream::once(async move { Ok(event) })))
+        }
+    }
+
+    /// `_meta` on `session/new` reaches the factory and the composed agent
+    /// serves the session's prompts.
+    #[tokio::test]
+    async fn factory_meta_composes_the_serving_agent() {
+        let (base, session_service) = mock_agent_and_session();
+        let factory = RecordingFactory::new();
+        let metas = factory.metas.clone();
+        let served_by = factory.served_by.clone();
+        let config = AcpServerConfigBuilder::new()
+            .agent(base)
+            .agent_factory(Arc::new(factory))
+            .session_service(session_service)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        let (server, client) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let mut request = NewSessionRequest::new(std::env::current_dir().expect("absolute cwd"));
+                    request.meta = Some(override_meta("test-model"));
+                    let session = connection.send_request(request).block_task().await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session.session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("hello"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        let _ = server;
+        tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("connection completed before timeout")
+            .expect("official ACP client completed")
+            .expect("factory-composed session prompt must succeed");
+
+        let metas = metas.lock().unwrap();
+        assert_eq!(metas.len(), 1, "factory called exactly once");
+        assert!(
+            metas[0].contains("agentx/model") && metas[0].contains("test-model"),
+            "factory received the _meta map verbatim: {}",
+            metas[0]
+        );
+        assert_eq!(*served_by.lock().unwrap(), vec!["call-0".to_string()]);
+    }
+
+    /// `session/new` **without** `_meta` still routes through a configured
+    /// factory: the factory receives an empty map plus the session's cwd, and
+    /// the composed agent serves the prompt. Per-cwd concerns (file-domain
+    /// binding) must cover every session, not only override-carrying ones.
+    #[tokio::test]
+    async fn factory_without_meta_receives_empty_map_and_cwd() {
+        let (base, session_service) = mock_agent_and_session();
+        let factory = RecordingFactory::new();
+        let metas = factory.metas.clone();
+        let cwds = factory.cwds.clone();
+        let served_by = factory.served_by.clone();
+        let config = AcpServerConfigBuilder::new()
+            .agent(base)
+            .agent_factory(Arc::new(factory))
+            .session_service(session_service)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        let (server, client) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    // No `_meta` on purpose: the plain-client shape.
+                    let request =
+                        NewSessionRequest::new(std::env::current_dir().expect("absolute cwd"));
+                    let session = connection.send_request(request).block_task().await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session.session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("hello"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        let _ = server;
+        tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("connection completed before timeout")
+            .expect("official ACP client completed")
+            .expect("factory-composed session prompt must succeed");
+
+        let metas = metas.lock().unwrap();
+        assert_eq!(metas.len(), 1, "factory called even without _meta");
+        assert_eq!(metas[0], "{}", "factory received an empty map: {}", metas[0]);
+        let cwds = cwds.lock().unwrap();
+        assert_eq!(
+            cwds.len(),
+            1,
+            "one build call records one cwd (metas/cwds stay paired)"
+        );
+        assert_eq!(
+            cwds[0],
+            std::env::current_dir().expect("absolute cwd").display().to_string(),
+            "factory received the session/new cwd verbatim: {}",
+            cwds[0]
+        );
+        assert_eq!(*served_by.lock().unwrap(), vec!["call-0".to_string()]);
+    }
+
+    /// `session/load` **without** `_meta` keeps the session's factory-composed
+    /// agent: the rebind preserves it and no second factory call happens.
+    #[tokio::test]
+    async fn load_without_meta_preserves_the_session_agent() {
+        let (base, session_service) = mock_agent_and_session();
+        let factory = RecordingFactory::new();
+        let metas = factory.metas.clone();
+        let served_by = factory.served_by.clone();
+        let config = AcpServerConfigBuilder::new()
+            .agent(base)
+            .agent_factory(Arc::new(factory))
+            .session_service(session_service)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        // Connection 1: create with overrides, run one turn.
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let (server1, client1) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let mut request = NewSessionRequest::new(std::env::current_dir().expect("absolute cwd"));
+                    request.meta = Some(override_meta("model-a"));
+                    let session = connection.send_request(request).block_task().await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session.session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("first"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    session_tx
+                        .send((session.session_id, std::env::current_dir().expect("absolute cwd")))
+                        .expect("test awaits the session");
+                    Ok(())
+                })
+            }),
+        );
+        let _ = server1;
+        tokio::time::timeout(std::time::Duration::from_secs(5), client1)
+            .await
+            .expect("connection 1 completed before timeout")
+            .expect("official ACP client completed")
+            .expect("first turn must succeed");
+        let (session_id, cwd) = session_rx.await.expect("session created");
+
+        // Connection 2: load with no `_meta`, run a turn — same factory agent.
+        let (_server2, client2) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    connection
+                        .send_request(LoadSessionRequest::new(session_id.clone(), cwd))
+                        .block_task()
+                        .await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new("second"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client2)
+            .await
+            .expect("connection 2 completed before timeout")
+            .expect("official ACP client completed")
+            .expect("load without _meta must succeed");
+
+        assert_eq!(
+            metas.lock().unwrap().len(),
+            1,
+            "no rebuild: load without _meta keeps the existing agent"
+        );
+        assert_eq!(
+            *served_by.lock().unwrap(),
+            vec!["call-0".to_string(), "call-0".to_string()],
+            "both turns served by the same factory-composed agent"
+        );
+    }
+
+    /// `session/load` **with** `_meta` rebuilds the session's agent through
+    /// the factory with the fresh overrides.
+    #[tokio::test]
+    async fn load_with_meta_rebuilds_the_session_agent() {
+        let (base, session_service) = mock_agent_and_session();
+        let factory = RecordingFactory::new();
+        let metas = factory.metas.clone();
+        let served_by = factory.served_by.clone();
+        let config = AcpServerConfigBuilder::new()
+            .agent(base)
+            .agent_factory(Arc::new(factory))
+            .session_service(session_service)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        let (session_tx, session_rx) = tokio::sync::oneshot::channel();
+        let (server1, client1) = spawn_acp_connection(
+            handler.clone(),
+            capabilities.clone(),
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let mut request = NewSessionRequest::new(std::env::current_dir().expect("absolute cwd"));
+                    request.meta = Some(override_meta("model-a"));
+                    let session = connection.send_request(request).block_task().await?;
+                    session_tx
+                        .send((session.session_id, std::env::current_dir().expect("absolute cwd")))
+                        .expect("test awaits the session");
+                    Ok(())
+                })
+            }),
+        );
+        let _ = server1;
+        tokio::time::timeout(std::time::Duration::from_secs(5), client1)
+            .await
+            .expect("connection 1 completed before timeout")
+            .expect("official ACP client completed")
+            .expect("session creation must succeed");
+        let (session_id, cwd) = session_rx.await.expect("session created");
+
+        let (_server2, client2) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let mut request = LoadSessionRequest::new(session_id.clone(), cwd);
+                    request.meta = Some(override_meta("model-b"));
+                    connection.send_request(request).block_task().await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new("second"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), client2)
+            .await
+            .expect("connection 2 completed before timeout")
+            .expect("official ACP client completed")
+            .expect("load with _meta must succeed");
+
+        let metas = metas.lock().unwrap();
+        assert_eq!(metas.len(), 2, "the load rebuilt through the factory");
+        assert!(
+            metas[1].contains("model-b"),
+            "rebuild saw the fresh overrides: {}",
+            metas[1]
+        );
+        assert_eq!(
+            *served_by.lock().unwrap(),
+            vec!["call-1".to_string()],
+            "the post-load turn was served by the rebuilt agent"
+        );
+    }
+
+    /// A factory error fails `session/new` loudly — no silent base fallback.
+    #[tokio::test]
+    async fn factory_error_fails_session_new() {
+        let (base, session_service) = mock_agent_and_session();
+        let mut factory = RecordingFactory::new();
+        factory.fail = true;
+        let config = AcpServerConfigBuilder::new()
+            .agent(base)
+            .agent_factory(Arc::new(factory))
+            .session_service(session_service)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        let (server, client) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let mut request = NewSessionRequest::new(std::env::current_dir().expect("absolute cwd"));
+                    request.meta = Some(override_meta("bad"));
+                    let outcome = connection.send_request(request).block_task().await;
+                    assert!(
+                        outcome.is_err(),
+                        "session/new must fail when the factory rejects the overrides"
+                    );
+                    Ok(())
+                })
+            }),
+        );
+        let _ = server;
+        tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("connection completed before timeout")
+            .expect("official ACP client completed")
+            .expect("the rejected session/new must surface as a client error");
+    }
+
+    /// Without a factory, `_meta` rides the request harmlessly and the
+    /// config-level agent serves every session (legacy behaviour unchanged).
+    #[tokio::test]
+    async fn no_factory_meta_is_ignored_and_base_agent_serves() {
+        let base_served = Arc::new(Mutex::new(false));
+        let agent: Arc<dyn Agent> = Arc::new(RecordingBaseAgent { served: base_served.clone() });
+        let session_svc: Arc<dyn SessionService> =
+            Arc::new(adk_session::InMemorySessionService::new());
+        let config = AcpServerConfigBuilder::new()
+            .agent(agent)
+            .session_service(session_svc)
+            .build()
+            .expect("valid config");
+        let capabilities = CapabilitiesBuilder::build(&config);
+        let handler =
+            Arc::new(AcpSessionHandler::new(&config, CancellationToken::new()).expect("handler"));
+
+        let (server, client) = spawn_acp_connection(
+            handler,
+            capabilities,
+            Box::new(move |connection| {
+                Box::pin(async move {
+                    connection
+                        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                        .block_task()
+                        .await?;
+                    let mut request = NewSessionRequest::new(std::env::current_dir().expect("absolute cwd"));
+                    request.meta = Some(override_meta("ignored-model"));
+                    let session = connection.send_request(request).block_task().await?;
+                    let prompt = connection
+                        .send_request(PromptRequest::new(
+                            session.session_id.clone(),
+                            vec![ContentBlock::Text(TextContent::new("hello"))],
+                        ))
+                        .block_task()
+                        .await?;
+                    assert_eq!(prompt.stop_reason, StopReason::EndTurn);
+                    Ok(())
+                })
+            }),
+        );
+        let _ = server;
+        tokio::time::timeout(std::time::Duration::from_secs(5), client)
+            .await
+            .expect("connection completed before timeout")
+            .expect("official ACP client completed")
+            .expect("meta without a factory must not disturb the session");
+        assert!(
+            *base_served.lock().unwrap(),
+            "the config-level agent served the prompt"
         );
     }
 }

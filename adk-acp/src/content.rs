@@ -51,7 +51,7 @@ const MAX_BASE64_ENCODED_SIZE: usize = MAX_INLINE_DATA_SIZE.div_ceil(3) * 4;
 /// # Example
 ///
 /// ```rust
-/// use adk_acp::content::block_to_part;
+/// use agentx_adk_acp::content::block_to_part;
 /// use adk_core::Part;
 /// use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
 ///
@@ -105,7 +105,7 @@ pub fn block_to_part(block: &ContentBlock) -> Result<Part, AcpError> {
 /// # Example
 ///
 /// ```rust
-/// use adk_acp::content::part_to_block;
+/// use agentx_adk_acp::content::part_to_block;
 /// use adk_core::Part;
 /// use agent_client_protocol::schema::v1::ContentBlock;
 ///
@@ -168,7 +168,7 @@ pub fn part_to_block(part: &Part) -> Option<ContentBlock> {
 /// # Example
 ///
 /// ```rust
-/// use adk_acp::content::content_to_blocks;
+/// use agentx_adk_acp::content::content_to_blocks;
 /// use adk_core::{Content, Part};
 /// use agent_client_protocol::schema::v1::ContentBlock;
 ///

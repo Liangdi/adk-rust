@@ -248,6 +248,20 @@ impl Anthropic {
         &self.base_url
     }
 
+    /// Attach extra headers to every request (gateway identity headers etc.).
+    ///
+    /// Entries replace a same-named default header (e.g. a gateway's own
+    /// `anthropic-version`) and are merged into the client's cached header
+    /// set, so all requests made by this client carry them.
+    pub fn with_extra_headers(mut self, headers: HeaderMap) -> Self {
+        let mut merged = (*self.cached_headers).clone();
+        for (name, value) in &headers {
+            merged.insert(name.clone(), value.clone());
+        }
+        self.cached_headers = Arc::new(merged);
+        self
+    }
+
     /// Set a custom timeout for this client.
     ///
     /// This method allows you to specify a different timeout for API requests.
@@ -1226,6 +1240,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn extra_headers_merge_into_the_cached_set_and_replace_defaults() {
+        let mut extra = HeaderMap::new();
+        extra.insert("x-agent-id", HeaderValue::from_static("agent-7"));
+        extra.insert("anthropic-version", HeaderValue::from_static("2023-06-01-custom"));
+
+        let client = Anthropic::new(Some("placeholder-api-key".to_string()))
+            .expect("client creation failed")
+            .with_extra_headers(extra);
+
+        let headers = client.default_headers();
+        assert_eq!(headers.get("x-agent-id").unwrap(), "agent-7");
+        // A same-named extra header replaces the built-in default.
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01-custom");
+    }
 
     #[tokio::test]
     async fn retry_logic_with_backoff() {

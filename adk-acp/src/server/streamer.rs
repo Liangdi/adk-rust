@@ -20,8 +20,10 @@ impl ResponseStreamer {
     ///
     /// Content parts are mapped first (message, thought, tool-call lifecycle),
     /// followed by a single [`SessionUpdate::UsageUpdate`] when the event
-    /// carries usage metadata. Events without usage metadata produce no usage
-    /// update, and reported token counts are never fabricated.
+    /// carries usage metadata. Events without usage metadata — or with a
+    /// zeroed placeholder shell (`total_token_count` of 0, which some providers
+    /// stream before the final chunk) — produce no usage update, and reported
+    /// token counts are never fabricated.
     pub fn map_event(event: &Event) -> Vec<SessionUpdate> {
         Self::map_event_filtered(event, true)
     }
@@ -55,7 +57,13 @@ impl ResponseStreamer {
             Self::map_content(content, suppress_agent_text, &mut updates);
         }
         if let Some(usage) = &event.llm_response.usage_metadata {
-            updates.push(SessionUpdate::UsageUpdate(map_usage(usage)));
+            // Skip zeroed placeholders some providers stream before the final
+            // usage chunk (same rule as the agentx transcript consumer): a
+            // non-positive total carries no real accounting and would surface
+            // as a `used: 0` UsageUpdate on the ACP wire.
+            if usage.total_token_count > 0 {
+                updates.push(SessionUpdate::UsageUpdate(map_usage(usage)));
+            }
         }
         updates
     }
@@ -558,6 +566,42 @@ mod tests {
             }
             other => panic!("expected a single usage update, got {other:?}"),
         }
+    }
+
+    /// A zeroed usage shell (`total_token_count == 0`, optionally with stray
+    /// per-bucket counts or even a cost attached) is a placeholder some
+    /// providers stream before the final chunk. It must not surface as a
+    /// `used: 0` `UsageUpdate` — mirrors the agentx transcript consumer's
+    /// placeholder skip.
+    #[test]
+    fn skips_zero_total_usage_placeholder_shell() {
+        let mut event = Event::new("inv-usage-shell");
+        event.llm_response.usage_metadata = Some(UsageMetadata {
+            prompt_token_count: 0,
+            candidates_token_count: 0,
+            total_token_count: 0,
+            ..Default::default()
+        });
+
+        let updates = ResponseStreamer::map_event(&event);
+        assert!(
+            updates.iter().all(|update| !matches!(update, SessionUpdate::UsageUpdate(_))),
+            "zero-total placeholder must not emit a usage update, got {updates:?}"
+        );
+
+        // Stray per-bucket counts or a cost must not resurrect the shell.
+        event.llm_response.usage_metadata = Some(UsageMetadata {
+            prompt_token_count: 12,
+            candidates_token_count: 3,
+            total_token_count: 0,
+            cost: Some(0.0),
+            ..Default::default()
+        });
+        let updates = ResponseStreamer::map_event(&event);
+        assert!(
+            updates.iter().all(|update| !matches!(update, SessionUpdate::UsageUpdate(_))),
+            "zero-total shell with stray counts must not emit a usage update, got {updates:?}"
+        );
     }
 
     /// **Feature: acp-v1-full-support, Property 6: Tool-call correlation**

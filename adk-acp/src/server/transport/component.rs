@@ -211,6 +211,7 @@ pub fn build_agent_component(
                                 request.mcp_servers,
                                 cancellation,
                                 replay_connection,
+                                request.meta,
                             )
                             .await;
                         let response = match result {

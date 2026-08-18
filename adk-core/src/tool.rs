@@ -104,7 +104,8 @@ pub trait Tool: Send + Sync {
     /// Indicates whether this tool performs no side effects.
     ///
     /// [`ToolExecutionStrategy::Auto`] includes a call in its concurrent subset
-    /// only when the selected tool is both read-only and concurrency-safe.
+    /// when the selected tool is both read-only and concurrency-safe, or when
+    /// the tool opts in via [`Tool::is_parallel_safe`].
     fn is_read_only(&self) -> bool {
         false
     }
@@ -112,9 +113,40 @@ pub trait Tool: Send + Sync {
     /// Indicates whether this tool is safe for concurrent execution.
     ///
     /// [`ToolExecutionStrategy::Auto`] requires this signal in addition to
-    /// [`Tool::is_read_only`]. [`ToolExecutionStrategy::Parallel`] is an
-    /// explicit caller override and does not inspect either signal.
+    /// [`Tool::is_read_only`]. A tool that is *not* read-only can still join
+    /// the concurrent subset by opting in via [`Tool::is_parallel_safe`].
+    /// [`ToolExecutionStrategy::Parallel`] is an explicit caller override and
+    /// does not inspect any of these signals.
     fn is_concurrency_safe(&self) -> bool {
+        false
+    }
+
+    /// Indicates whether this tool may run concurrently even though it is not
+    /// read-only: the third and strongest concurrency tier.
+    ///
+    /// This is the explicit opt-in for delegation/spawn-style tools. Such a
+    /// tool has side effects, but they are isolated per call — each invocation
+    /// touches only its own child resource (a spawned sub-agent, an isolated
+    /// session, a per-call worktree) — so overlapping invocations, including
+    /// concurrent invocations of the very same tool, cannot observe or corrupt
+    /// one another. It is the tool author's declaration that per-call isolation
+    /// substitutes for read-only-ness, NOT a weakening of the read-only rule
+    /// for tools that have not opted in.
+    ///
+    /// [`ToolExecutionStrategy::Auto`] routes a call into its concurrent subset
+    /// when this flag is set, *or* when the tool is both read-only and
+    /// concurrency-safe ([`Tool::is_read_only`] +
+    /// [`Tool::is_concurrency_safe`]). [`ToolExecutionStrategy::Parallel`]
+    /// remains an explicit caller override and does not inspect this signal.
+    ///
+    /// Because this tier admits side-effectful tools, callers that spawn
+    /// unbounded resources per invocation (one child process per call, say)
+    /// should enforce their own spawn cap — e.g. via
+    /// [`ToolConcurrencyConfig`](crate::ToolConcurrencyConfig) per-tool limits,
+    /// which the dispatch loop's semaphore enforces on every strategy.
+    ///
+    /// Defaults to `false`.
+    fn is_parallel_safe(&self) -> bool {
         false
     }
 
@@ -355,8 +387,13 @@ pub enum ToolExecutionStrategy {
     /// This is an explicit caller override. The caller is responsible for
     /// ensuring every selected tool is safe to execute concurrently.
     Parallel,
-    /// Execute calls whose tools report both read-only and concurrency-safe
-    /// concurrently, then execute all remaining calls sequentially.
+    /// Execute calls whose tools opt into concurrency concurrently, then
+    /// execute all remaining calls sequentially.
+    ///
+    /// A call opts in when its tool reports both read-only and
+    /// concurrency-safe, or when it declares the parallel-safe tier
+    /// (`Tool::is_parallel_safe`) reserved for side-effectful tools whose
+    /// effects are isolated per call (delegation/spawn style).
     Auto,
 }
 

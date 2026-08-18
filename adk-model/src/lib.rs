@@ -260,6 +260,8 @@ pub(crate) mod attachment;
 pub mod azure_ai;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+/// Shared `(name, value)` → `HeaderMap` parsing for provider extra headers.
+pub mod custom_headers;
 #[cfg(feature = "deepseek")]
 pub mod deepseek;
 /// Gemini model provider (Google AI Studio and Vertex AI).

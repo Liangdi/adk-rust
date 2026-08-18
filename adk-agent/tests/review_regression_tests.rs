@@ -248,15 +248,25 @@ impl Tool for IdCapturingTool {
 struct ConcurrencyProbeTool {
     active: Arc<AtomicUsize>,
     max_active: Arc<AtomicUsize>,
+    read_only: bool,
     concurrency_safe: bool,
+    parallel_safe: bool,
 }
 
 impl ConcurrencyProbeTool {
+    /// Read-only probe parameterized by concurrency safety (the classic tier).
     fn new(concurrency_safe: bool) -> Self {
+        Self::with_flags(true, concurrency_safe, false)
+    }
+
+    /// Fully parameterized probe: (read_only, concurrency_safe, parallel_safe).
+    fn with_flags(read_only: bool, concurrency_safe: bool, parallel_safe: bool) -> Self {
         Self {
             active: Arc::new(AtomicUsize::new(0)),
             max_active: Arc::new(AtomicUsize::new(0)),
+            read_only,
             concurrency_safe,
+            parallel_safe,
         }
     }
 }
@@ -272,11 +282,15 @@ impl Tool for ConcurrencyProbeTool {
     }
 
     fn is_read_only(&self) -> bool {
-        true
+        self.read_only
     }
 
     fn is_concurrency_safe(&self) -> bool {
         self.concurrency_safe
+    }
+
+    fn is_parallel_safe(&self) -> bool {
+        self.parallel_safe
     }
 
     async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
@@ -291,6 +305,15 @@ impl Tool for ConcurrencyProbeTool {
 async fn max_concurrent_tool_calls(
     strategy: adk_core::ToolExecutionStrategy,
     concurrency_safe: bool,
+) -> usize {
+    max_concurrent_probe_calls(strategy, ConcurrencyProbeTool::new(concurrency_safe)).await
+}
+
+/// Dispatch a two-call batch of `probe` under `strategy` and report the
+/// highest number of simultaneously in-flight executions observed.
+async fn max_concurrent_probe_calls(
+    strategy: adk_core::ToolExecutionStrategy,
+    probe: ConcurrencyProbeTool,
 ) -> usize {
     let model = Arc::new(RecordingModel::new(vec![
         RecordingModel::function_calls(vec![
@@ -309,7 +332,7 @@ async fn max_concurrent_tool_calls(
         ]),
         RecordingModel::text_response("done"),
     ]));
-    let tool = Arc::new(ConcurrencyProbeTool::new(concurrency_safe));
+    let tool = Arc::new(probe);
     let max_active = tool.max_active.clone();
     let agent = LlmAgentBuilder::new("tool-agent")
         .model(model)
@@ -544,6 +567,30 @@ async fn test_auto_parallelizes_read_only_concurrency_safe_tool() {
     let max_active = max_concurrent_tool_calls(adk_core::ToolExecutionStrategy::Auto, true).await;
 
     assert_eq!(max_active, 2);
+}
+
+#[tokio::test]
+async fn test_auto_parallelizes_parallel_safe_non_read_only_tool() {
+    // Delegation/spawn-style tier: the tool has side effects (not read-only)
+    // but declares per-call isolation via parallel_safe, so Auto must route
+    // it into the concurrent subset without either classic flag.
+    let probe = ConcurrencyProbeTool::with_flags(false, false, true);
+    let max_active =
+        max_concurrent_probe_calls(adk_core::ToolExecutionStrategy::Auto, probe).await;
+
+    assert_eq!(max_active, 2);
+}
+
+#[tokio::test]
+async fn test_auto_serializes_non_read_only_tool_without_parallel_safe() {
+    // concurrency_safe alone must NOT promote a non-read-only tool: without
+    // the parallel_safe opt-in the call stays in the sequential subset (the
+    // read_only && concurrency_safe rule itself is unchanged).
+    let probe = ConcurrencyProbeTool::with_flags(false, true, false);
+    let max_active =
+        max_concurrent_probe_calls(adk_core::ToolExecutionStrategy::Auto, probe).await;
+
+    assert_eq!(max_active, 1);
 }
 
 #[tokio::test]

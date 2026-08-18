@@ -50,7 +50,7 @@ use tracing::info;
 
 pub use agent_client_protocol::schema::v1::SessionNotification;
 pub use capabilities::{AgentCapabilities, CapabilitiesBuilder};
-pub use config::{AcpServerConfig, AcpServerConfigBuilder, TransportConfig};
+pub use config::{AcpServerConfig, AcpServerConfigBuilder, AgentFactory, TransportConfig};
 pub use error::{AcpServerError, ErrorResponse};
 pub use handler::AcpSessionHandler;
 pub use modes::{SessionControls, config_state_key};

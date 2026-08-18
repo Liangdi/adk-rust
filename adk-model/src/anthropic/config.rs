@@ -127,6 +127,10 @@ pub struct AnthropicConfig {
     /// When `None`, all available tools are loaded.
     #[serde(skip)]
     pub tool_search: Option<ToolSearchConfig>,
+    /// Extra HTTP headers stamped on every request (gateway identity etc.),
+    /// as ordered `(name, value)` pairs. Parsed once at client construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
 }
 
 fn default_max_tokens() -> u32 {
@@ -155,6 +159,7 @@ impl Default for AnthropicConfig {
             beta_features: Vec::new(),
             api_version: None,
             tool_search: None,
+            extra_headers: Vec::new(),
         }
     }
 }
@@ -174,6 +179,15 @@ impl AnthropicConfig {
     /// Set a custom base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Set extra HTTP headers stamped on every request (gateway identity
+    /// etc.). Invalid names/values surface as an error at client
+    /// construction.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
         self
     }
 

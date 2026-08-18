@@ -25,6 +25,30 @@ use adk_session::SessionService;
 use super::error::AcpServerError;
 use super::modes::SessionControls;
 
+/// Builds a per-session agent from the `_meta` extension map carried on
+/// `session/new` / `session/load`, plus the session's `cwd`.
+///
+/// When set on [`AcpServerConfig`], **every** new session gets an agent
+/// composed by this factory — a `session/new` without `_meta` passes an
+/// empty map and the factory decides the base composition; a
+/// `session/load` that carries `_meta` rebuilds the session's agent
+/// through the same path. Both the map and the cwd are passed through
+/// verbatim — interpreting extension keys (e.g. model/env overrides) or
+/// binding the session's tool file domain to the cwd is the
+/// implementation's job, not the protocol layer's. An error fails the
+/// session request loudly (invalid overrides must not degrade to a silent
+/// base composition).
+pub trait AgentFactory: Send + Sync {
+    /// Compose an agent for one session from the request's `_meta` map
+    /// (empty when the request carried no `_meta`) and the session's cwd
+    /// (already absolute — request-level validation ran before this).
+    fn build(
+        &self,
+        meta: &serde_json::Map<String, serde_json::Value>,
+        cwd: &std::path::Path,
+    ) -> Result<Arc<dyn Agent>, String>;
+}
+
 /// Transport selection for the ACP Server.
 #[derive(Clone, Debug, Default)]
 pub enum TransportConfig {
@@ -68,6 +92,11 @@ pub struct AcpServerConfig {
     /// configuration options, preserving capability accuracy for agents that
     /// expose no interactive session controls.
     pub session_controls: Option<Arc<dyn SessionControls>>,
+    /// Optional per-session agent factory driven by request `_meta`.
+    ///
+    /// When `None` (the default), `agent` serves every session — behaviour is
+    /// byte-identical to a server built without this field.
+    pub agent_factory: Option<Arc<dyn AgentFactory>>,
 }
 
 /// Builder for [`AcpServerConfig`] with validation.
@@ -91,6 +120,7 @@ pub struct AcpServerConfigBuilder {
     shutdown_timeout: Duration,
     transport: TransportConfig,
     session_controls: Option<Arc<dyn SessionControls>>,
+    agent_factory: Option<Arc<dyn AgentFactory>>,
 }
 
 impl Default for AcpServerConfigBuilder {
@@ -112,6 +142,7 @@ impl AcpServerConfigBuilder {
             shutdown_timeout: Duration::from_secs(30),
             transport: TransportConfig::Stdio,
             session_controls: None,
+            agent_factory: None,
         }
     }
 
@@ -171,6 +202,14 @@ impl AcpServerConfigBuilder {
         self
     }
 
+    /// Set the per-session agent factory driven by request `_meta` (optional).
+    ///
+    /// When unset, the `agent` set above serves every session unchanged.
+    pub fn agent_factory(mut self, factory: Arc<dyn AgentFactory>) -> Self {
+        self.agent_factory = Some(factory);
+        self
+    }
+
     /// Build the configuration, validating all required fields.
     ///
     /// # Errors
@@ -210,6 +249,7 @@ impl AcpServerConfigBuilder {
             shutdown_timeout: self.shutdown_timeout,
             transport: self.transport,
             session_controls: self.session_controls,
+            agent_factory: self.agent_factory,
         })
     }
 }

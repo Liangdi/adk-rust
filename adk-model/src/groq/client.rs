@@ -27,6 +27,7 @@ use serde_json::Value;
 pub struct GroqClient {
     client: Client,
     config: GroqConfig,
+    extra_headers: reqwest::header::HeaderMap,
     retry_config: RetryConfig,
 }
 
@@ -36,8 +37,9 @@ impl GroqClient {
         let client = Client::builder()
             .build()
             .map_err(|e| AdkError::model(format!("Failed to create HTTP client: {e}")))?;
+        let extra_headers = crate::custom_headers::parse_extra_headers(&config.extra_headers)?;
 
-        Ok(Self { client, config, retry_config: RetryConfig::default() })
+        Ok(Self { client, config, extra_headers, retry_config: RetryConfig::default() })
     }
 
     /// Create a client for llama-3.3-70b-versatile model.
@@ -136,6 +138,7 @@ impl Llm for GroqClient {
         let usage_span = adk_telemetry::llm_generate_span("groq", &self.config.model, stream);
         let api_url = self.api_url();
         let api_key = self.config.api_key.clone();
+        let extra_headers = self.extra_headers.clone();
         let chat_request = self.build_request(&request, stream);
         let client = self.client.clone();
         let retry_config = self.retry_config.clone();
@@ -147,12 +150,14 @@ impl Llm for GroqClient {
                 let client = client.clone();
                 let api_url = api_url.clone();
                 let api_key = api_key.clone();
+                let extra_headers = extra_headers.clone();
                 let chat_request = chat_request.clone();
                 async move {
                     let response = client
                         .post(&api_url)
                         .header("Authorization", format!("Bearer {}", api_key))
                         .header("Content-Type", "application/json")
+                        .headers(extra_headers)
                         .json(&chat_request)
                         .send()
                         .await
@@ -369,5 +374,25 @@ impl Llm for GroqClient {
         };
 
         Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_headers_parse_at_client_construction() {
+        let config = GroqConfig::new("test-key", "llama-3.3-70b-versatile")
+            .with_extra_headers(vec![("X-Agent-Id".to_string(), "agent-7".to_string())]);
+        let client = GroqClient::new(config).expect("client creation failed");
+        assert_eq!(client.extra_headers.get("x-agent-id").unwrap(), "agent-7");
+    }
+
+    #[test]
+    fn invalid_extra_header_name_fails_construction() {
+        let config = GroqConfig::new("test-key", "llama-3.3-70b-versatile")
+            .with_extra_headers(vec![("Bad Name".to_string(), "v".to_string())]);
+        assert!(GroqClient::new(config).is_err());
     }
 }

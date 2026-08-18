@@ -64,7 +64,7 @@ impl From<u8> for AgentStatus {
 /// # Example
 ///
 /// ```rust
-/// use adk_acp::status::{AgentStatus, StatusTracker};
+/// use agentx_adk_acp::status::{AgentStatus, StatusTracker};
 ///
 /// let tracker = StatusTracker::new();
 /// assert_eq!(tracker.get(), AgentStatus::Starting);

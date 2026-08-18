@@ -10,7 +10,7 @@ use adk_core::{
 use async_stream::stream;
 use async_trait::async_trait;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tracing::Instrument;
@@ -302,6 +302,96 @@ fn collapse_duplicated_snapshot(acc: &mut Option<Content>, last_chunk: Option<&L
         } else {
             merge_parts_of_kind(acc, kind);
         }
+    }
+}
+
+/// Answer tool calls that a cancelled invocation left dangling in a restored
+/// conversation history.
+///
+/// An interrupted turn can persist a settled model message whose function
+/// calls never got results — the tool was still running when the run was
+/// cancelled (e.g. the TUI's Esc×2). OpenAI-compatible and Anthropic wire
+/// validators reject the next request unless every `tool_calls` message is
+/// followed by matching responses, so one interruption would leave the
+/// session erroring on every subsequent prompt. The repair is request-side
+/// only — stored events are untouched — and each synthesized response says
+/// the tool was interrupted so the model knows no result ever happened.
+fn repair_dangling_tool_calls(history: &mut Vec<Content>) {
+    // Calls with an id are answered by an exact id match; legacy id-less
+    // calls fall back to name matching (first come, first served).
+    let mut answered_ids: HashSet<String> = HashSet::new();
+    let mut answered_names: Vec<String> = Vec::new();
+    for content in history.iter() {
+        for part in &content.parts {
+            match part {
+                Part::FunctionResponse {
+                    id: Some(id), ..
+                } => {
+                    answered_ids.insert(id.clone());
+                }
+                Part::FunctionResponse {
+                    function_response,
+                    id: None,
+                    ..
+                } => answered_names.push(function_response.name.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    // Walk backwards so insertions never invalidate earlier indices.
+    for index in (0..history.len()).rev() {
+        let missing: Vec<(Option<String>, String)> = history[index]
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::FunctionCall {
+                    name,
+                    id: Some(id),
+                    ..
+                } if !answered_ids.contains(id) => Some((Some(id.clone()), name.clone())),
+                Part::FunctionCall { name, id: None, .. } => {
+                    let pos = answered_names.iter().position(|n| n == name)?;
+                    answered_names.remove(pos);
+                    Some((None, name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        // Insert past the run of function-role contents that directly
+        // follows this model message (its already-arrived responses), so the
+        // synthetic parts sit beside them, after the calls they answer.
+        let mut insert_at = index + 1;
+        while history
+            .get(insert_at)
+            .is_some_and(|content| content.role == "function")
+        {
+            insert_at += 1;
+        }
+        let parts = missing
+            .into_iter()
+            .map(|(id, name)| Part::FunctionResponse {
+                function_response: FunctionResponseData::new(
+                    name,
+                    serde_json::json!({
+                        "error": "tool execution was interrupted before a result was produced",
+                        "interrupted": true,
+                    }),
+                ),
+                id,
+                annotations: None,
+            })
+            .collect();
+        history.insert(
+            insert_at,
+            Content {
+                role: "function".to_string(),
+                parts,
+            },
+        );
     }
 }
 
@@ -1253,7 +1343,9 @@ impl LlmAgentBuilder {
     /// for this agent's dispatch loop. When `None` (the default), the
     /// `RunConfig` value is used. [`ToolExecutionStrategy::Parallel`] is an
     /// explicit override that bypasses tool safety metadata, so the caller owns
-    /// concurrency safety.
+    /// concurrency safety. [`ToolExecutionStrategy::Auto`] routes each call by
+    /// tool metadata: read-only + concurrency-safe, or the `parallel_safe`
+    /// opt-in for side-effectful-but-per-call-isolated tools.
     pub fn tool_execution_strategy(mut self, strategy: ToolExecutionStrategy) -> Self {
         self.tool_execution_strategy = Some(strategy);
         self
@@ -2514,6 +2606,11 @@ impl Agent for LlmAgent {
                     return;
                 }
             };
+            // A previously cancelled invocation can leave tool calls without
+            // results in the restored history (the tool never finished).
+            // Answer them before the first request — see
+            // [`repair_dangling_tool_calls`].
+            repair_dangling_tool_calls(&mut conversation_history);
 
             let resolved_tools = match tool_setup.resolve(&ctx).await {
                 Ok(tools) => tools,
@@ -3311,12 +3408,17 @@ impl Agent for LlmAgent {
                                     .await
                                 }
                                 ToolExecutionStrategy::Auto => {
-                                    // A call may overlap another only when its tool is
-                                    // read-only *and* declares concurrency safety.
+                                    // A call may overlap another when its tool is
+                                    // read-only *and* declares concurrency safety, or
+                                    // when it opts into the parallel-safe tier — the
+                                    // delegation/spawn-style escape hatch for tools
+                                    // whose side effects are isolated per call.
                                     let (concurrent_fcs, sequential_fcs): (Vec<_>, Vec<_>) =
                                         fc_parts.into_iter().partition(|call| {
                                             tool_map.get(&call.name).is_some_and(|tool| {
-                                                tool.is_read_only() && tool.is_concurrency_safe()
+                                                tool.is_parallel_safe()
+                                                    || (tool.is_read_only()
+                                                        && tool.is_concurrency_safe())
                                             })
                                         });
                                     let mut all_results = Vec::new();
@@ -3624,5 +3726,148 @@ mod stream_accumulation_tests {
                 signature: Some("sig".to_string()),
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod dangling_tool_call_tests {
+    use super::*;
+
+    fn model_call(id: &str, name: &str) -> Content {
+        Content {
+            role: "model".to_string(),
+            parts: vec![Part::FunctionCall {
+                name: name.to_string(),
+                args: serde_json::json!({}),
+                id: Some(id.to_string()),
+                thought_signature: None,
+            }],
+        }
+    }
+
+    fn result(id: &str, name: &str) -> Content {
+        Content {
+            role: "function".to_string(),
+            parts: vec![Part::FunctionResponse {
+                function_response: FunctionResponseData::new(
+                    name.to_string(),
+                    serde_json::json!({"ok": true}),
+                ),
+                id: Some(id.to_string()),
+                annotations: None,
+            }],
+        }
+    }
+
+    fn user(s: &str) -> Content {
+        Content {
+            role: "user".to_string(),
+            parts: vec![Part::Text { text: s.to_string() }],
+        }
+    }
+
+    fn synthetic_parts(content: &Content) -> &Vec<Part> {
+        assert_eq!(content.role, "function", "synthetic content is function-role");
+        &content.parts
+    }
+
+    /// The interrupted-session shape: a settled model call whose tool was
+    /// still executing when the run was cancelled, then the user's next
+    /// prompt. Without repair every following request fails the provider's
+    /// tool-message pairing validation.
+    #[test]
+    fn tail_dangling_call_gets_an_interrupted_response() {
+        let mut history = vec![
+            user("分析项目"),
+            model_call("call-1", "run_shell_status"),
+            user("继续"),
+        ];
+        repair_dangling_tool_calls(&mut history);
+
+        assert_eq!(history.len(), 4, "one synthetic response inserted");
+        let parts = synthetic_parts(&history[2]);
+        let Part::FunctionResponse {
+            function_response,
+            id,
+            ..
+        } = &parts[0]
+        else {
+            panic!("expected a FunctionResponse, got {parts:?}");
+        };
+        assert_eq!(id.as_deref(), Some("call-1"));
+        assert_eq!(function_response.name, "run_shell_status");
+        assert!(
+            function_response.response.get("interrupted").is_some(),
+            "the response must say the tool never produced a result"
+        );
+    }
+
+    /// Fully-answered histories pass through untouched.
+    #[test]
+    fn answered_calls_are_left_alone() {
+        let history = vec![
+            user("hi"),
+            model_call("call-1", "read_file"),
+            result("call-1", "read_file"),
+            model_call("call-2", "grep"),
+            result("call-2", "grep"),
+        ];
+        let mut repaired = history.clone();
+        repair_dangling_tool_calls(&mut repaired);
+        // `Content` has no PartialEq — compare through the JSON form.
+        assert_eq!(
+            serde_json::to_value(&repaired).unwrap(),
+            serde_json::to_value(&history).unwrap(),
+            "no insertion, no reordering"
+        );
+    }
+
+    /// A cancelled parallel round where only some tools finished: the missing
+    /// ones get answers placed after the arrived results, next to them.
+    #[test]
+    fn partially_answered_parallel_round_repairs_only_the_missing() {
+        // The real wire shape: ONE model message carrying three parallel
+        // calls; only call-2's tool finished before the cancel.
+        let mut history = vec![
+            Content {
+                role: "model".to_string(),
+                parts: vec![
+                    Part::FunctionCall {
+                        name: "read_file".to_string(),
+                        args: serde_json::json!({}),
+                        id: Some("call-1".to_string()),
+                        thought_signature: None,
+                    },
+                    Part::FunctionCall {
+                        name: "run_shell".to_string(),
+                        args: serde_json::json!({}),
+                        id: Some("call-2".to_string()),
+                        thought_signature: None,
+                    },
+                    Part::FunctionCall {
+                        name: "grep".to_string(),
+                        args: serde_json::json!({}),
+                        id: Some("call-3".to_string()),
+                        thought_signature: None,
+                    },
+                ],
+            },
+            result("call-2", "run_shell"),
+            user("继续"),
+        ];
+        repair_dangling_tool_calls(&mut history);
+
+        // One synthetic function content after the existing result.
+        assert_eq!(history.len(), 4);
+        let parts = synthetic_parts(&history[2]);
+        assert_eq!(parts.len(), 2, "both missing calls answered together");
+        let ids: Vec<Option<&str>> = parts
+            .iter()
+            .filter_map(|part| match part {
+                Part::FunctionResponse { id, .. } => Some(id.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![Some("call-1"), Some("call-3")]);
     }
 }

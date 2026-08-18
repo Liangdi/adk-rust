@@ -21,6 +21,10 @@ pub struct GroqConfig {
     /// Maximum tokens for output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Extra HTTP headers stamped on every request (gateway identity etc.),
+    /// as ordered `(name, value)` pairs. Parsed once at client construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl Default for GroqConfig {
@@ -31,6 +35,7 @@ impl Default for GroqConfig {
             base_url: None,
             reasoning_enabled: false,
             max_tokens: None,
+            extra_headers: Vec::new(),
         }
     }
 }
@@ -76,6 +81,15 @@ impl GroqConfig {
     /// Set custom base URL.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
+        self
+    }
+
+    /// Set extra HTTP headers stamped on every request (gateway identity
+    /// etc.). Invalid names/values surface as an error at client
+    /// construction.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
         self
     }
 

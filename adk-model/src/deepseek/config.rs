@@ -94,6 +94,10 @@ pub struct DeepSeekConfig {
     /// `"strict": true` and the model strictly follows the JSON schema.
     #[serde(default)]
     pub strict_tools: bool,
+    /// Extra HTTP headers stamped on every request (gateway identity etc.),
+    /// as ordered `(name, value)` pairs. Parsed once at client construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_headers: Vec<(String, String)>,
 
     // --- Backward compatibility ---
     /// Legacy field: `true` maps to `thinking: Some(Enabled)`.
@@ -113,6 +117,7 @@ impl Default for DeepSeekConfig {
             max_tokens: None,
             beta: false,
             strict_tools: false,
+            extra_headers: Vec::new(),
             thinking_enabled: false,
         }
     }
@@ -223,6 +228,15 @@ impl DeepSeekConfig {
     pub fn with_strict_tools(mut self) -> Self {
         self.strict_tools = true;
         self.beta = true; // strict tools require beta
+        self
+    }
+
+    /// Set extra HTTP headers stamped on every request (gateway identity
+    /// etc.). Invalid names/values surface as an error at client
+    /// construction.
+    #[must_use]
+    pub fn with_extra_headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = headers;
         self
     }
 
