@@ -68,27 +68,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "adk-anthropic"
-version = "2.0.1"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "dotenvy",
- "futures",
- "hex",
- "hmac 0.12.1",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "time",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "adk-audio"
 version = "2.0.1"
 dependencies = [
@@ -901,6 +880,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentx-adk-anthropic"
+version = "2.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "dotenvy",
+ "futures",
+ "hex",
+ "hmac 0.12.1",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "time",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "agentx-adk-artifact"
 version = "2.0.1"
 dependencies = [
@@ -969,9 +969,9 @@ dependencies = [
 
 [[package]]
 name = "agentx-adk-model"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
- "adk-anthropic",
+ "agentx-adk-anthropic",
  "agentx-adk-core",
  "agentx-adk-gemini",
  "agentx-adk-telemetry",
@@ -1041,7 +1041,6 @@ name = "agentx-adk-rust"
 version = "2.0.1"
 dependencies = [
  "adk-action",
- "adk-anthropic",
  "adk-audio",
  "adk-auth",
  "adk-awp",
@@ -1063,6 +1062,7 @@ dependencies = [
  "adk-server",
  "agentx-adk-acp",
  "agentx-adk-agent",
+ "agentx-adk-anthropic",
  "agentx-adk-artifact",
  "agentx-adk-core",
  "agentx-adk-model",

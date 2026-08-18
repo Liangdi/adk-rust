@@ -1,5 +1,5 @@
 [package]
-name = "adk-anthropic"
+name = "agentx-adk-anthropic"
 description = "Dedicated Anthropic API client for ADK-Rust"
 version.workspace = true
 edition.workspace = true
