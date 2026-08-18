@@ -96,7 +96,13 @@ pub fn chat_response_to_llm_response(response: &ChatMessageResponse, partial: bo
     // Determine finish reason
     let finish_reason = if response.done { Some(FinishReason::Stop) } else { None };
 
-    // Extract usage metadata from final_data if available
+    // Extract usage metadata from final_data if available. Ollama reports
+    // token counts only on the final chunk (`done: true`); `final_data` is a
+    // `#[serde(flatten)] Option<struct-of-required-u64>` in ollama-rs, so a
+    // server that omits ANY field — notably `prompt_eval_count`, which Ollama
+    // leaves out when the whole prompt was served from cache — drops the
+    // entire struct and this maps to `None`. That cached-prompt gap is an
+    // upstream ollama-rs typing limitation, pinned by the tests below.
     let usage_metadata = response.final_data.as_ref().map(|data| UsageMetadata {
         prompt_token_count: data.prompt_eval_count as i32,
         candidates_token_count: data.eval_count as i32,
@@ -182,5 +188,46 @@ mod tests {
         let message = content_to_chat_message(&content).expect("message should be created");
         assert!(message.content.contains("text/csv"));
         assert!(message.content.contains("https://example.com/data.csv"));
+    }
+
+    /// The stream's final chunk carries the token counts via the flattened
+    /// `final_data`; the converter maps them onto `usage_metadata` so the
+    /// caller's telemetry (status bar / billing) sees them.
+    #[test]
+    fn final_chunk_token_counts_map_to_usage_metadata() {
+        let raw = r#"{"model":"llama3.2","created_at":"2025-01-01T00:00:00Z",
+            "message":{"role":"assistant","content":"hi"},"done":true,
+            "total_duration":1,"load_duration":1,
+            "prompt_eval_count":5,"prompt_eval_duration":1,
+            "eval_count":2,"eval_duration":1}"#;
+        let response: ChatMessageResponse =
+            serde_json::from_str(raw).expect("final chunk should parse");
+        let llm = chat_response_to_llm_response(&response, false);
+        let usage = llm.usage_metadata.as_ref().expect("usage should map");
+        assert_eq!(usage.prompt_token_count, 5);
+        assert_eq!(usage.candidates_token_count, 2);
+        assert_eq!(usage.total_token_count, 7);
+    }
+
+    /// Ollama omits `prompt_eval_count` (and its duration) when the whole
+    /// prompt was served from cache; ollama-rs types `final_data` as an
+    /// all-required flattened struct, so the entire struct drops and usage
+    /// is `None`. Pinning this upstream limitation — if this test ever
+    /// fails because ollama-rs made the fields optional, extend the
+    /// converter to treat a missing prompt count as zero instead.
+    #[test]
+    fn cached_prompt_final_chunk_loses_usage_upstream() {
+        let raw = r#"{"model":"llama3.2","created_at":"2025-01-01T00:00:00Z",
+            "message":{"role":"assistant","content":"hi"},"done":true,
+            "total_duration":1,"load_duration":1,
+            "eval_count":2,"eval_duration":1}"#;
+        let response: ChatMessageResponse =
+            serde_json::from_str(raw).expect("final chunk should parse");
+        assert!(
+            response.final_data.is_none(),
+            "ollama-rs drops final_data when prompt_eval_count is omitted"
+        );
+        let llm = chat_response_to_llm_response(&response, false);
+        assert!(llm.usage_metadata.is_none());
     }
 }

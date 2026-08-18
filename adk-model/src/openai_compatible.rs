@@ -420,23 +420,59 @@ fn parse_finish_reason(fr: &str) -> FinishReason {
 }
 
 /// Parse usage metadata from a raw SSE chunk JSON value.
+///
+/// Valid on ANY chunk of the stream, not just the `finish_reason` one:
+/// providers split usage across the wire differently — DeepSeek-style attaches
+/// it to the `finish_reason` chunk, strict OpenAI wire (after
+/// `stream_options.include_usage`) delivers it on a trailing `choices: []`
+/// chunk, and gateways may do either. Field fallbacks cover the dialects seen
+/// in the wild (aligned with the anycms-llm billing extractor):
+/// `prompt_tokens`→`input_tokens`, `completion_tokens`→`output_tokens`;
+/// cache read prefers DeepSeek's `prompt_cache_hit_tokens`, then
+/// `prompt_tokens_details.cached_tokens` (OpenAI chat), then
+/// `input_tokens_details.cached_tokens` (responses style); DeepSeek-style
+/// `prompt_cache_miss_tokens` maps to cache-creation.
+///
+/// Returns `None` when the usage is absent, `null` (every OpenAI choice chunk
+/// carries `"usage": null`), or all-zero — placeholder shells must not
+/// populate the holder.
 fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
     let u = chunk.get("usage")?;
-    let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let completion_tokens = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let total_tokens = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+    if !u.is_object() {
+        return None;
+    }
+    // prompt/completion names → responses-style input/output fallback.
+    let pick = |primary: &str, fallback: &str| {
+        u.get(primary)
+            .and_then(|v| v.as_i64())
+            .or_else(|| u.get(fallback).and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    };
+    let prompt_tokens = pick("prompt_tokens", "input_tokens");
+    let completion_tokens = pick("completion_tokens", "output_tokens");
+    let total_tokens =
+        u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(prompt_tokens + completion_tokens);
 
     let prompt_details = u.get("prompt_tokens_details");
+    let input_details = u.get("input_tokens_details");
     let completion_details = u.get("completion_tokens_details");
+    let details_cached = |details: Option<&serde_json::Value>| {
+        details.and_then(|d| d.get("cached_tokens")).and_then(|v| v.as_i64())
+    };
 
-    Some(UsageMetadata {
-        prompt_token_count: prompt_tokens,
-        candidates_token_count: completion_tokens,
-        total_token_count: total_tokens,
-        cache_read_input_token_count: prompt_details
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
+    let cache_read = u
+        .get("prompt_cache_hit_tokens")
+        .and_then(|v| v.as_i64())
+        .or_else(|| details_cached(prompt_details))
+        .or_else(|| details_cached(input_details));
+    let cache_creation = u.get("prompt_cache_miss_tokens").and_then(|v| v.as_i64());
+
+    let usage = UsageMetadata {
+        prompt_token_count: prompt_tokens as i32,
+        candidates_token_count: completion_tokens as i32,
+        total_token_count: total_tokens as i32,
+        cache_read_input_token_count: cache_read.map(|v| v as i32),
+        cache_creation_input_token_count: cache_creation.map(|v| v as i32),
         thinking_token_count: completion_details
             .and_then(|d| d.get("reasoning_tokens"))
             .and_then(|v| v.as_i64())
@@ -450,7 +486,8 @@ fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
         ..Default::default()
-    })
+    };
+    (usage.total_token_count > 0).then_some(usage)
 }
 
 #[async_trait]
@@ -534,6 +571,18 @@ impl Llm for OpenAICompatible {
                 let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
                     HashMap::new();
                 let mut text_tool_buffer = crate::tool_call_parser::ToolCallBuffer::new();
+                // Usage seen on any chunk of this response. Strict OpenAI wire
+                // delivers it on a trailing `choices: []` chunk AFTER the
+                // `finish_reason` chunk (via `stream_options.include_usage`),
+                // so the final response cannot carry it until it arrives —
+                // hence the holder below.
+                let mut pending_usage: Option<UsageMetadata> = None;
+                // The `finish_reason` response, withheld until its usage
+                // resolves: flushed when a later usage chunk lands, at
+                // `[DONE]`, or at stream end. (Mirrors the OpenRouter
+                // adapter's hold-back; DeepSeek-style usage riding the finish
+                // chunk itself is taken eagerly below.)
+                let mut held_final: Option<LlmResponse> = None;
 
                 while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result.map_err(|e| {
@@ -551,7 +600,17 @@ impl Llm for OpenAICompatible {
                         let line = buffer[consumed..consumed + line_end].trim().to_string();
                         consumed += line_end + 1;
 
-                        if line.is_empty() || line == "data: [DONE]" {
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if line == "data: [DONE]" {
+                            // End of stream: any held finish goes out with
+                            // whatever usage ever arrived (or none).
+                            if let Some(mut final_response) = held_final.take() {
+                                final_response.usage_metadata =
+                                    final_response.usage_metadata.or(pending_usage.take());
+                                yield final_response;
+                            }
                             continue;
                         }
 
@@ -565,6 +624,27 @@ impl Llm for OpenAICompatible {
                                     continue;
                                 }
                             };
+
+                            // Fold usage BEFORE the choices guard: the
+                            // trailing usage chunk carries `"choices": []`
+                            // and would be skipped below. Counts are
+                            // monotonic across the stream (every usage frame
+                            // reports the whole turn), so keep the larger.
+                            if let Some(usage) = parse_usage_from_chunk(&chunk_json) {
+                                pending_usage = match pending_usage {
+                                    Some(prev) if prev.total_token_count >= usage.total_token_count => {
+                                        Some(prev)
+                                    }
+                                    _ => Some(usage),
+                                };
+                                // A held finish that was waiting on exactly
+                                // this usage can go out now.
+                                if let Some(mut final_response) = held_final.take() {
+                                    final_response.usage_metadata =
+                                        final_response.usage_metadata.or(pending_usage.take());
+                                    yield final_response;
+                                }
+                            }
 
                             let choice = match chunk_json.get("choices").and_then(|c| c.get(0)) {
                                 Some(c) => c,
@@ -613,10 +693,14 @@ impl Llm for OpenAICompatible {
                                 }
                             }
 
-                            // Check for finish_reason → emit final response.
+                            // Check for finish_reason → build the final response
+                            // and hold it for its usage (see `held_final`).
                             if let Some(ref fr) = finish_reason_str {
                                 let finish_reason = Some(parse_finish_reason(fr));
-                                let usage_metadata = parse_usage_from_chunk(&chunk_json);
+                                // DeepSeek-style usage rode this same chunk and
+                                // was folded above; strict OpenAI wire sends
+                                // none here (the trailing chunk carries it).
+                                let usage_metadata = pending_usage.take();
 
                                 // Emit accumulated tool calls if any.
                                 if !tool_call_accumulators.is_empty() {
@@ -639,7 +723,7 @@ impl Llm for OpenAICompatible {
                                         })
                                         .collect();
 
-                                    yield LlmResponse {
+                                    held_final = Some(LlmResponse {
                                         content: Some(Content {
                                             role: "model".to_string(),
                                             parts,
@@ -656,7 +740,7 @@ impl Llm for OpenAICompatible {
                                         error_message: None,
                                         provider_metadata: None,
                                         interaction_id: None,
-                                    };
+                                    });
                                     continue;
                                 }
 
@@ -667,7 +751,7 @@ impl Llm for OpenAICompatible {
                                         parts.push(Part::Text { text: text.to_string() });
                                     }
 
-                                yield LlmResponse {
+                                held_final = Some(LlmResponse {
                                     content: if parts.is_empty() { None } else {
                                         Some(Content {
                                             role: "model".to_string(),
@@ -684,7 +768,7 @@ impl Llm for OpenAICompatible {
                                     error_message: None,
                                     provider_metadata: None,
                                     interaction_id: None,
-                                };
+                                });
                                 continue;
                             }
 
@@ -751,6 +835,14 @@ impl Llm for OpenAICompatible {
                         }
                     }
                     buffer.drain(..consumed);
+                }
+
+                // Stream ended without `[DONE]` (some servers just close):
+                // a still-held finish goes out with whatever usage arrived.
+                if let Some(mut final_response) = held_final.take() {
+                    final_response.usage_metadata =
+                        final_response.usage_metadata.or(pending_usage.take());
+                    yield final_response;
                 }
 
                 // Flush any remaining buffered content from the tool call buffer
@@ -876,5 +968,239 @@ mod tests {
         let config = OpenAICompatibleConfig::gemini("k", "gemini-3.5-flash");
         let client = OpenAICompatible::new(config).expect("client builds");
         assert_eq!(client.name(), "gemini-3.5-flash");
+    }
+
+    // ── streaming usage extraction ──────────────────────────────────────
+
+    mod stream_usage {
+        use super::*;
+        use adk_core::{Content, LlmRequest};
+        use futures::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn test_client(base_url: String) -> OpenAICompatible {
+            OpenAICompatible::new(
+                OpenAICompatibleConfig::new("test-key", "gpt-test")
+                    .with_provider_name("openai-compat-test")
+                    .with_base_url(base_url),
+            )
+            .expect("client should build")
+        }
+
+        fn request() -> LlmRequest {
+            LlmRequest::new("gpt-test", vec![Content::new("user").with_text("hello")])
+        }
+
+        async fn drive(client: &OpenAICompatible) -> Vec<LlmResponse> {
+            let mut stream =
+                client.generate_content(request(), true).await.expect("generation should start");
+            let mut responses = Vec::new();
+            while let Some(item) = stream.next().await {
+                responses.push(item.expect("chunk should succeed"));
+            }
+            responses
+        }
+
+        /// Strict OpenAI wire (`stream_options.include_usage`): every choice
+        /// chunk carries `"usage": null` and the real counts arrive on a
+        /// trailing `"choices": []` chunk AFTER `finish_reason`. The held
+        /// final must pick them up — the regression this hold-back fixes.
+        #[tokio::test]
+        async fn usage_on_trailing_empty_choices_chunk_attaches_to_final() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}],\"usage\":null}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n\
+                     data: [DONE]\n\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let responses = drive(&test_client(server.uri())).await;
+
+            assert_eq!(responses.len(), 2, "one partial + one final");
+            assert!(responses[0].partial);
+            assert!(!responses[1].partial);
+            assert_eq!(responses[1].finish_reason, Some(FinishReason::Stop));
+            let usage =
+                responses[1].usage_metadata.as_ref().expect("final must carry the trailing usage");
+            assert_eq!(usage.prompt_token_count, 10);
+            assert_eq!(usage.candidates_token_count, 5);
+            assert_eq!(usage.total_token_count, 15);
+            assert_eq!(usage.cache_read_input_token_count, Some(4));
+        }
+
+        /// DeepSeek-style wire: usage rides the `finish_reason` chunk itself.
+        /// Pre-existing behavior, preserved by the hold-back (flushed at
+        /// `[DONE]`), with the DeepSeek cache dialect mapped.
+        #[tokio::test]
+        async fn usage_riding_finish_chunk_attaches_to_final() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10,\"prompt_cache_hit_tokens\":2,\"prompt_cache_miss_tokens\":5}}\n\n\
+                     data: [DONE]\n\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let responses = drive(&test_client(server.uri())).await;
+
+            assert_eq!(responses.len(), 2);
+            let usage =
+                responses[1].usage_metadata.as_ref().expect("finish-chunk usage must survive");
+            assert_eq!(usage.prompt_token_count, 7);
+            assert_eq!(usage.total_token_count, 10);
+            assert_eq!(usage.cache_read_input_token_count, Some(2));
+            assert_eq!(usage.cache_creation_input_token_count, Some(5));
+        }
+
+        /// Tool-call finals are held too: a multi-step agent turn must credit
+        /// the step that made the calls, not lose usage because the final
+        /// lacks text.
+        #[tokio::test]
+        async fn tool_call_final_holds_for_trailing_usage() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\\\"SF\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"total_tokens\":24}}\n\n\
+                     data: [DONE]\n\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let responses = drive(&test_client(server.uri())).await;
+
+            let final_response = responses
+                .iter()
+                .rev()
+                .find(|r| !r.partial)
+                .expect("a non-partial final must be emitted");
+            assert!(!final_response.turn_complete, "tool-call turns stay open");
+            assert!(final_response.content.as_ref().is_some_and(|c| c.has_function_calls()));
+            assert_eq!(
+                final_response.usage_metadata.as_ref().map(|u| u.total_token_count),
+                Some(24)
+            );
+        }
+
+        /// Servers that close the stream without `[DONE]`: the held final
+        /// (and any usage) still flushes at stream end.
+        #[tokio::test]
+        async fn stream_end_without_done_marker_flushes_held_final() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let responses = drive(&test_client(server.uri())).await;
+
+            let final_response = responses
+                .iter()
+                .rev()
+                .find(|r| !r.partial)
+                .expect("held final must flush at stream end");
+            assert_eq!(
+                final_response.usage_metadata.as_ref().map(|u| u.total_token_count),
+                Some(11)
+            );
+        }
+
+        /// A provider that reports no usage at all keeps working: the final
+        /// goes out at `[DONE]` with `usage_metadata: None`.
+        #[tokio::test]
+        async fn usage_free_stream_still_emits_final() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+                     data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+                     data: [DONE]\n\n",
+                ))
+                .mount(&server)
+                .await;
+
+            let responses = drive(&test_client(server.uri())).await;
+
+            assert_eq!(responses.len(), 2);
+            assert!(!responses[1].partial);
+            assert!(responses[1].usage_metadata.is_none());
+        }
+
+        // ── parse_usage_from_chunk dialects ────────────────────────────
+
+        /// OpenAI streams carry `"usage": null` on every choice chunk —
+        /// those must parse to `None`, not a zeroed placeholder.
+        #[test]
+        fn parse_usage_rejects_null_and_zeroed_shells() {
+            assert!(parse_usage_from_chunk(&serde_json::json!({})).is_none());
+            assert!(
+                parse_usage_from_chunk(&serde_json::json!({"choices": [], "usage": null}))
+                    .is_none()
+            );
+            assert!(
+                parse_usage_from_chunk(&serde_json::json!({"usage": {
+                    "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0
+                }}))
+                .is_none()
+            );
+        }
+
+        /// Responses-style dialects name the buckets input/output and tuck
+        /// cache under `input_tokens_details.cached_tokens`; total is
+        /// derived when the wire omits it.
+        #[test]
+        fn parse_usage_falls_back_to_responses_style_fields() {
+            let usage = parse_usage_from_chunk(&serde_json::json!({"usage": {
+                "input_tokens": 8,
+                "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 6}
+            }}))
+            .expect("responses-style usage should parse");
+            assert_eq!(usage.prompt_token_count, 8);
+            assert_eq!(usage.candidates_token_count, 2);
+            assert_eq!(usage.total_token_count, 10, "total derived as input+output");
+            assert_eq!(usage.cache_read_input_token_count, Some(6));
+        }
+
+        /// The cache-read fallback order: DeepSeek's flat
+        /// `prompt_cache_hit_tokens` wins over OpenAI's nested
+        /// `prompt_tokens_details.cached_tokens`.
+        #[test]
+        fn parse_usage_prefers_deepseek_cache_fields() {
+            let usage = parse_usage_from_chunk(&serde_json::json!({"usage": {
+                "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11,
+                "prompt_cache_hit_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 3}
+            }}))
+            .expect("usage should parse");
+            assert_eq!(usage.cache_read_input_token_count, Some(7));
+            assert_eq!(usage.cache_creation_input_token_count, None);
+
+            let nested = parse_usage_from_chunk(&serde_json::json!({"usage": {
+                "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 3}
+            }}))
+            .expect("usage should parse");
+            assert_eq!(nested.cache_read_input_token_count, Some(3));
+        }
     }
 }

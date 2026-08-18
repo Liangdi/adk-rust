@@ -85,6 +85,26 @@ pub struct ChatCompletionResponse {
     pub choices: Vec<Choice>,
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// Groq's stream contract carries the final usage under `x_groq.usage`
+    /// while the OpenAI-spec top-level `usage` stays null on choice chunks.
+    #[serde(default, rename = "x_groq")]
+    pub x_groq: Option<XGroq>,
+}
+
+impl ChatCompletionResponse {
+    /// The response's usage, preferring the OpenAI-spec top-level field and
+    /// falling back to Groq's `x_groq.usage` wrapper.
+    pub fn effective_usage(&self) -> Option<Usage> {
+        self.usage.clone().or_else(|| self.x_groq.as_ref().and_then(|g| g.usage.clone()))
+    }
+}
+
+/// Groq's stream-extension envelope (`x_groq`), which wraps the final
+/// chunk's usage.
+#[derive(Debug, Clone, Deserialize)]
+pub struct XGroq {
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// Response choice.
@@ -327,9 +347,28 @@ pub fn from_response(response: &ChatCompletionResponse) -> LlmResponse {
 }
 
 /// Create a tool call response for accumulated tool calls.
+/// Map a Groq usage record onto the ADK metadata shape, including the
+/// cache-read and reasoning detail buckets.
+pub(crate) fn usage_to_metadata(u: &Usage) -> UsageMetadata {
+    let mut meta = UsageMetadata {
+        prompt_token_count: u.prompt_tokens as i32,
+        candidates_token_count: u.completion_tokens as i32,
+        total_token_count: u.total_tokens as i32,
+        ..Default::default()
+    };
+    if let Some(ref details) = u.prompt_tokens_details {
+        meta.cache_read_input_token_count = details.cached_tokens.map(|t| t as i32);
+    }
+    if let Some(ref details) = u.completion_tokens_details {
+        meta.thinking_token_count = details.reasoning_tokens.map(|t| t as i32);
+    }
+    meta
+}
+
 pub fn create_tool_call_response(
     tool_calls: Vec<(String, String, Value)>,
     finish_reason: Option<FinishReason>,
+    usage: Option<Usage>,
 ) -> LlmResponse {
     let parts: Vec<Part> = tool_calls
         .into_iter()
@@ -343,7 +382,7 @@ pub fn create_tool_call_response(
 
     LlmResponse {
         content: Some(Content { role: "model".to_string(), parts }),
-        usage_metadata: None,
+        usage_metadata: usage.as_ref().map(usage_to_metadata),
         finish_reason,
         citation_metadata: None,
         partial: false,
@@ -382,5 +421,37 @@ mod tests {
         let payload = message.content.unwrap_or_default();
         assert!(payload.contains("application/pdf"));
         assert!(payload.contains("https://example.com/report.pdf"));
+    }
+
+    /// Groq's stream contract keeps the OpenAI-spec top-level `usage` null on
+    /// choice chunks and delivers the real counts under `x_groq.usage` — the
+    /// effective-usage fallback must pick them up.
+    #[test]
+    fn effective_usage_falls_back_to_x_groq() {
+        let chunk: ChatCompletionResponse = serde_json::from_str(
+            r#"{"id":"c1","object":"chat.completion.chunk","created":1,"model":"llama-3.3-70b",
+                "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
+                "usage":null,
+                "x_groq":{"id":"req_1","usage":{"prompt_tokens":3,"completion_tokens":6,"total_tokens":9}}}"#,
+        )
+        .expect("chunk should parse");
+        assert!(chunk.usage.is_none(), "top-level usage stays null");
+        let usage = chunk.effective_usage().expect("x_groq usage should win");
+        assert_eq!(usage.prompt_tokens, 3);
+        assert_eq!(usage.completion_tokens, 6);
+        assert_eq!(usage.total_tokens, 9);
+    }
+
+    /// A plain top-level `usage` (non-streaming responses, some Groq models)
+    /// still takes precedence over the wrapper.
+    #[test]
+    fn effective_usage_prefers_top_level() {
+        let chunk: ChatCompletionResponse = serde_json::from_str(
+            r#"{"id":"c1","object":"chat.completion","created":1,"model":"llama-3.3-70b",
+                "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        )
+        .expect("chunk should parse");
+        assert_eq!(chunk.effective_usage().map(|u| u.total_tokens), Some(12));
     }
 }
