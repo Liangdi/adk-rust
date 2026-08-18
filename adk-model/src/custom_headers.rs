@@ -12,7 +12,7 @@
 
 use adk_core::{AdkError, ErrorCategory, ErrorComponent};
 
-/// Parse ordered `(name, value)` pairs into a [`reqwest::header::HeaderMap`].
+/// Parse ordered `(name, value)` pairs into a [`http::header::HeaderMap`].
 ///
 /// Surrounding whitespace is trimmed; duplicate names keep the last value.
 /// Invalid header names (e.g. containing spaces) or values (e.g. containing
@@ -20,13 +20,13 @@ use adk_core::{AdkError, ErrorCategory, ErrorComponent};
 /// any request is sent.
 pub fn parse_extra_headers(
     pairs: &[(String, String)],
-) -> Result<reqwest::header::HeaderMap, AdkError> {
-    let mut map = reqwest::header::HeaderMap::new();
+) -> Result<http::header::HeaderMap, AdkError> {
+    let mut map = http::header::HeaderMap::new();
     for (raw_name, value) in pairs {
         // Keep the user-written spelling for errors; `HeaderName` itself
         // lowercases on parse.
         let raw_name = raw_name.trim();
-        let name = reqwest::header::HeaderName::try_from(raw_name).map_err(|e| {
+        let name = http::header::HeaderName::try_from(raw_name).map_err(|e| {
             AdkError::new(
                 ErrorComponent::Model,
                 ErrorCategory::InvalidInput,
@@ -34,7 +34,7 @@ pub fn parse_extra_headers(
                 format!("invalid custom header name '{raw_name}': {e}"),
             )
         })?;
-        let value = reqwest::header::HeaderValue::try_from(value.trim()).map_err(|e| {
+        let value = http::header::HeaderValue::try_from(value.trim()).map_err(|e| {
             AdkError::new(
                 ErrorComponent::Model,
                 ErrorCategory::InvalidInput,

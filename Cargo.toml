@@ -192,6 +192,7 @@ adk-deploy = { path = "adk-deploy", version = "2.0.0" }
 adk-payments = { path = "adk-payments", version = "2.0.0" }
 adk-action = { path = "adk-action", version = "2.0.0" }
 adk-anthropic = { path = "adk-anthropic", version = "2.0.0" }
+http = "1"
 adk-managed = { path = "adk-managed", version = "2.0.0", default-features = false }
 adk-enterprise = { path = "adk-enterprise", version = "2.0.0" }
 adk-bench = { path = "adk-bench", version = "2.0.0" }

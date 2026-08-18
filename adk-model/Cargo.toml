@@ -25,6 +25,8 @@ serde = { workspace = true }
 async-openai = { version = "0.41", optional = true, default-features = false, features = ["rustls", "chat-completion", "responses"] }
 adk-anthropic = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+# custom_headers 的 header 类型（reqwest::header 即 http 的再导出；直接依赖解 feature 门）
+http = { workspace = true }
 tokio-tungstenite = { workspace = true, optional = true }
 anyhow.workspace = true
 tracing.workspace = true
