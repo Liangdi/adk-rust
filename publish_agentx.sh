@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 cd /home/liangdi/workspace/agent/adk-rust
-ORDER=(agentx-adk-core adk-anthropic agentx-adk-model agentx-adk-tool agentx-adk-agent agentx-adk-acp)
+ORDER=(agentx-adk-model agentx-adk-tool agentx-adk-agent agentx-adk-acp)
 for c in "${ORDER[@]}"; do
   for attempt in 1 2 3 4 5 6; do
     echo "=== [$c] attempt $attempt $(date -u +%H:%M:%S) ==="
