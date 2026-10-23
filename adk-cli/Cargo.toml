@@ -35,7 +35,7 @@ adk-skill.workspace = true
 adk-deploy.workspace = true
 adk-graph = { workspace = true, features = ["time-travel"] }
 clap = { version = "4.6", features = ["derive"] }
-rustyline = "18.0"
+rustyline = "19.0"
 tokio = { workspace = true, features = ["full"] }
 anyhow.workspace = true
 futures.workspace = true
